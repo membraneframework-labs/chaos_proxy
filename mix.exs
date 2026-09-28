@@ -21,7 +21,9 @@ defmodule ChaosProxy.MixProject do
       # docs
       name: "ChaosProxy",
       source_url: @github_url,
-      docs: docs()
+      docs: docs(),
+      homepage_url: "https://membrane.stream",
+      aliases: [docs: ["docs", &append_llms_links/1]]
     ]
   end
 
@@ -52,7 +54,10 @@ defmodule ChaosProxy.MixProject do
     [
       maintainers: ["Membrane Team"],
       licenses: ["Apache-2.0"],
-      links: %{"GitHub" => @github_url},
+      links: %{
+        "GitHub" => @github_url,
+        "Membrane Framework Homepage" => "https://membrane.stream"
+      },
       files: ["lib", "mix.exs", "README*", "LICENSE*", ".formatter.exs"]
     ]
   end
@@ -61,7 +66,30 @@ defmodule ChaosProxy.MixProject do
     [
       main: "readme",
       extras: ["README.md", "LICENSE"],
-      source_ref: "v#{@version}"
+      source_ref: "v#{@version}",
+      nest_modules_by_prefix: [ChaosProxy]
     ]
+  end
+
+  defp append_llms_links(_args) do
+    output_dir = docs()[:output] || "doc"
+    path = Path.join(output_dir, "llms.txt")
+
+    if File.exists?(path) do
+      existing = File.read!(path)
+
+      footer = """
+
+
+      ## See Also
+
+      - [Membrane Framework AI Skill](https://hexdocs.pm/membrane_core/skill.md)
+      - [Membrane Core](https://hexdocs.pm/membrane_core/llms.txt)
+      """
+
+      File.write!(path, String.trim_trailing(existing) <> footer)
+    else
+      IO.warn("#{path} not found — llms.txt was not generated, check your ex_doc configuration")
+    end
   end
 end

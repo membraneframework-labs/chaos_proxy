@@ -59,6 +59,11 @@ defmodule ChaosProxy do
 
   @bucket_ms 1_000
 
+  # Kernel receive buffer of every socket, so that a burst is dropped (and
+  # counted) by the shaper rather than silently by the kernel in front of it.
+  # The OS default can be small: often ~208 KB on Linux.
+  @recbuf 4_000_000
+
   @type direction :: :up | :down
 
   @type counters :: %{
@@ -113,7 +118,7 @@ defmodule ChaosProxy do
         family(listen_ip),
         active: true,
         ip: listen_ip,
-        recbuf: 4_000_000
+        recbuf: @recbuf
       ])
 
     upstream_ip = resolve!(Keyword.get(opts, :upstream_host, "127.0.0.1"))
@@ -179,7 +184,10 @@ defmodule ChaosProxy do
 
         _none ->
           {upstream_ip, _port} = state.upstream
-          {:ok, upstream} = :gen_udp.open(0, [:binary, family(upstream_ip), active: true])
+
+          {:ok, upstream} =
+            :gen_udp.open(0, [:binary, family(upstream_ip), active: true, recbuf: @recbuf])
+
           {upstream, %{state | upstreams: Map.put(state.upstreams, upstream, client)}}
       end
 

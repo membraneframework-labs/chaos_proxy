@@ -86,6 +86,71 @@ defmodule ChaosProxy do
   @type impairments ::
           Impairment.t() | [{:up, Impairment.t()} | {:down, Impairment.t()}]
 
+  @typep counter ::
+           :offered_bytes
+           | :forwarded_bytes
+           | :dropped_packets
+           | :lost_packets
+           | :blackout_packets
+           | :queue_bytes_max
+           | :refused_packets
+
+  defmodule State do
+    @moduledoc false
+
+    alias ChaosProxy.Link
+
+    @type client :: {:inet.ip_address(), :inet.port_number()}
+
+    # Addressed to the client's upstream socket on the way up, to the client on
+    # the way down.
+    @type packet :: {:gen_udp.socket() | client(), binary()}
+
+    @type per_direction(value) :: %{up: value, down: value}
+
+    @type t :: %__MODULE__{
+            listen: :gen_udp.socket(),
+            upstream: {:inet.ip_address(), :inet.port_number()},
+            links: per_direction(Link.t()),
+            drain_timers: per_direction(reference() | nil),
+            delayed: per_direction(:queue.queue({number(), packet()})),
+            delay_timers: per_direction(reference() | nil),
+            started_at: float(),
+            history: pos_integer() | :infinity,
+            client_idle_ms: non_neg_integer() | :infinity,
+            max_clients: pos_integer() | :infinity,
+            totals: per_direction(ChaosProxy.counters()),
+            clients: %{client() => %{socket: :gen_udp.socket(), seen_ms: float()}},
+            upstreams: %{:gen_udp.socket() => client()},
+            current: ChaosProxy.second() | nil,
+            seconds: [ChaosProxy.second()]
+          }
+
+    @enforce_keys [
+      :listen,
+      :upstream,
+      :links,
+      :started_at,
+      :history,
+      :client_idle_ms,
+      :max_clients,
+      :totals
+    ]
+    defstruct @enforce_keys ++
+                [
+                  drain_timers: %{up: nil, down: nil},
+                  delayed: %{up: :queue.new(), down: :queue.new()},
+                  delay_timers: %{up: nil, down: nil},
+                  clients: %{},
+                  upstreams: %{},
+                  current: nil,
+                  seconds: []
+                ]
+  end
+
+  @typep client :: State.client()
+  @typep packet :: State.packet()
+
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, Keyword.take(opts, [:name]))
 
@@ -138,22 +203,15 @@ defmodule ChaosProxy do
       )
 
     {:ok,
-     %{
+     %State{
        listen: listen,
        upstream: {upstream_ip, Keyword.fetch!(opts, :upstream_port)},
        links: %{down: Link.new(down, seed, now), up: Link.new(up, seed + 3, now)},
-       drain_timers: %{up: nil, down: nil},
-       delayed: %{up: :queue.new(), down: :queue.new()},
-       delay_timers: %{up: nil, down: nil},
        started_at: now,
        history: Keyword.get(opts, :history, 300),
        client_idle_ms: Keyword.get(opts, :client_idle_ms, 60_000),
        max_clients: Keyword.get(opts, :max_clients, :infinity),
-       totals: %{up: empty_counters(), down: empty_counters()},
-       clients: %{},
-       upstreams: %{},
-       current: nil,
-       seconds: []
+       totals: %{up: empty_counters(), down: empty_counters()}
      }}
   end
 
@@ -168,8 +226,8 @@ defmodule ChaosProxy do
 
     state =
       Enum.reduce(impairments, state, fn {direction, impairment}, state ->
-        state
-        |> update_in([:links, direction], &Link.apply(&1, impairment, now))
+        state.links[direction]
+        |> update_in(&Link.apply(&1, impairment, now))
         |> drain(direction)
       end)
 
@@ -183,7 +241,7 @@ defmodule ChaosProxy do
   end
 
   @impl true
-  def handle_info({:udp, listen, ip, port, data}, %{listen: listen} = state) do
+  def handle_info({:udp, listen, ip, port, data}, %State{listen: listen} = state) do
     client = {ip, port}
 
     case upstream(state, client) do
@@ -216,6 +274,7 @@ defmodule ChaosProxy do
     {:noreply, flush(put_in(state.delay_timers[direction], nil), direction)}
   end
 
+  @spec offer(State.t(), direction(), packet(), non_neg_integer()) :: State.t()
   defp offer(state, direction, packet, size) do
     state = count(state, direction, :offered_bytes, size)
     {outcome, link} = Link.offer(state.links[direction], packet, size, now_ms())
@@ -229,6 +288,7 @@ defmodule ChaosProxy do
     end
   end
 
+  @spec drain(State.t(), direction()) :: State.t()
   defp drain(state, direction) do
     now = now_ms()
     {released, link, wait_ms} = Link.drain(state.links[direction], now)
@@ -237,8 +297,8 @@ defmodule ChaosProxy do
 
     state =
       Enum.reduce(released, state, fn {_to, data} = packet, state ->
-        state
-        |> update_in([:delayed, direction], &:queue.in({due, packet}, &1))
+        state.delayed[direction]
+        |> update_in(&:queue.in({due, packet}, &1))
         |> count(direction, :forwarded_bytes, byte_size(data))
       end)
 
@@ -256,6 +316,7 @@ defmodule ChaosProxy do
   # The delay line: one FIFO and one timer per direction, so packets leave in
   # the order they were released. A shorter delay does not overtake packets
   # still held for a longer one.
+  @spec flush(State.t(), direction()) :: State.t()
   defp flush(state, direction) do
     now = now_ms()
     timer = state.delay_timers[direction]
@@ -264,8 +325,8 @@ defmodule ChaosProxy do
       {:value, {due, packet}} when due <= now ->
         deliver(state, direction, packet)
 
-        state
-        |> update_in([:delayed, direction], &:queue.drop/1)
+        state.delayed[direction]
+        |> update_in(&:queue.drop/1)
         |> flush(direction)
 
       {:value, {due, _packet}} when timer == nil ->
@@ -278,6 +339,7 @@ defmodule ChaosProxy do
   end
 
   # The upstream socket may have been closed for an expired client meanwhile.
+  @spec deliver(State.t(), direction(), packet()) :: :ok | {:error, term()}
   defp deliver(state, :up, {upstream, data}) do
     {ip, port} = state.upstream
     _result = :gen_udp.send(upstream, ip, port, data)
@@ -289,6 +351,7 @@ defmodule ChaosProxy do
 
   # The client's upstream socket, opened for a new client unless the proxy is
   # at `:max_clients` even after forgetting idle ones.
+  @spec upstream(State.t(), client()) :: {:ok, :gen_udp.socket(), State.t()} | {:full, State.t()}
   defp upstream(state, client) do
     case state.clients do
       %{^client => %{socket: upstream}} ->
@@ -310,14 +373,17 @@ defmodule ChaosProxy do
     end
   end
 
-  defp full?(%{max_clients: :infinity}), do: false
+  @spec full?(State.t()) :: boolean()
+  defp full?(%State{max_clients: :infinity}), do: false
   defp full?(state), do: map_size(state.clients) >= state.max_clients
 
+  @spec split(impairments()) :: %{optional(direction()) => Impairment.t()}
   defp split(%Impairment{} = down),
     do: %{down: down, up: %Impairment{delay_ms: down.delay_ms, blackout?: down.blackout?}}
 
   defp split(impairments) when is_list(impairments), do: Map.new(impairments)
 
+  @spec resolve!(:inet.ip_address() | :inet.hostname() | String.t()) :: :inet.ip_address()
   defp resolve!(ip) when is_tuple(ip), do: ip
 
   defp resolve!(host) do
@@ -331,19 +397,23 @@ defmodule ChaosProxy do
     end
   end
 
+  @spec family(:inet.ip_address()) :: :inet | :inet6
   defp family(ip) when tuple_size(ip) == 8, do: :inet6
   defp family(_ip), do: :inet
 
+  @spec now_ms() :: float()
   defp now_ms, do: System.monotonic_time(:microsecond) / 1_000
 
   ## Clients
 
+  @spec touch(State.t(), client(), :gen_udp.socket()) :: State.t()
   defp touch(state, client, upstream),
     do: %{state | clients: Map.put(state.clients, client, %{socket: upstream, seen_ms: now_ms()})}
 
   # A client that went away leaves its upstream socket behind; checked when a
   # second rolls over and on `report/1`.
-  defp expire_clients(%{client_idle_ms: :infinity} = state), do: state
+  @spec expire_clients(State.t()) :: State.t()
+  defp expire_clients(%State{client_idle_ms: :infinity} = state), do: state
 
   defp expire_clients(state) do
     cutoff = now_ms() - state.client_idle_ms
@@ -362,6 +432,7 @@ defmodule ChaosProxy do
 
   ## Counters
 
+  @spec count(State.t(), direction(), counter(), non_neg_integer()) :: State.t()
   defp count(state, direction, key, amount) do
     state = rotate(state)
 
@@ -375,12 +446,12 @@ defmodule ChaosProxy do
           &Map.update!(&1, key, fn sum -> sum + amount end)
       end
 
-    state
-    |> update_in([:current, direction], bump)
-    |> update_in([:totals, direction], bump)
+    state = update_in(state.current[direction], bump)
+    update_in(state.totals[direction], bump)
   end
 
   # Moves on to the current second's bucket, archiving the previous one.
+  @spec rotate(State.t()) :: State.t()
   defp rotate(state) do
     second = trunc((now_ms() - state.started_at) / @bucket_ms)
 
@@ -396,11 +467,16 @@ defmodule ChaosProxy do
     end
   end
 
-  defp keep(second, %{history: :infinity, seconds: seconds}), do: [second | seconds]
-  defp keep(second, %{history: n, seconds: seconds}), do: Enum.take([second | seconds], n - 1)
+  @spec keep(second(), State.t()) :: [second()]
+  defp keep(second, %State{history: :infinity, seconds: seconds}), do: [second | seconds]
 
+  defp keep(second, %State{history: n, seconds: seconds}),
+    do: Enum.take([second | seconds], n - 1)
+
+  @spec empty_second(non_neg_integer()) :: second()
   defp empty_second(second), do: %{second: second, up: empty_counters(), down: empty_counters()}
 
+  @spec empty_counters() :: counters()
   defp empty_counters,
     do: %{
       offered_bytes: 0,

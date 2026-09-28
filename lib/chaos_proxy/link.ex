@@ -89,6 +89,7 @@ defmodule ChaosProxy.Link do
   @spec queue_bytes(t()) :: non_neg_integer()
   def queue_bytes(link), do: link.queue_bytes
 
+  @spec release(t(), [packet()]) :: {[packet()], t(), pos_integer() | nil}
   defp release(link, released) do
     case :queue.peek(link.queue) do
       :empty ->
@@ -111,12 +112,15 @@ defmodule ChaosProxy.Link do
     end
   end
 
+  @spec affordable?(t(), non_neg_integer()) :: boolean()
   defp affordable?(%{impairment: %Impairment{rate_kbps: :infinity}}, _size), do: true
   defp affordable?(link, size), do: link.tokens >= size
 
+  @spec spend(t(), non_neg_integer()) :: number()
   defp spend(%{impairment: %Impairment{rate_kbps: :infinity}} = link, _size), do: link.tokens
   defp spend(link, size), do: link.tokens - size
 
+  @spec lost?(t()) :: {boolean(), t()}
   defp lost?(%{impairment: %Impairment{loss_pct: pct}} = link) when pct <= 0, do: {false, link}
 
   defp lost?(%{impairment: %Impairment{loss_pct: pct}} = link) do
@@ -124,6 +128,7 @@ defmodule ChaosProxy.Link do
     {x * 100 < pct, %{link | rng: rng}}
   end
 
+  @spec refill(t(), number()) :: t()
   defp refill(%{impairment: %Impairment{rate_kbps: :infinity}} = link, now),
     do: %{link | refilled_at: now}
 
@@ -133,11 +138,14 @@ defmodule ChaosProxy.Link do
     %{link | tokens: min(tokens, burst_bytes(impairment)), refilled_at: now}
   end
 
+  @spec bytes_per_ms(Impairment.t()) :: float()
   defp bytes_per_ms(%Impairment{rate_kbps: rate}), do: rate / 8
 
+  @spec burst_bytes(Impairment.t()) :: number()
   defp burst_bytes(%Impairment{rate_kbps: :infinity}), do: 0.0
   defp burst_bytes(impairment), do: max(3 * @mtu, bytes_per_ms(impairment) * 20)
 
+  @spec queue_cap_bytes(Impairment.t()) :: pos_integer() | :infinity
   defp queue_cap_bytes(%Impairment{rate_kbps: :infinity}), do: :infinity
 
   defp queue_cap_bytes(%Impairment{queue_ms: queue_ms} = impairment),

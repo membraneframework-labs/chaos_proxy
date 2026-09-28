@@ -40,7 +40,7 @@ port = ChaosProxy.port(proxy)   # point the clients here
 :ok = ChaosProxy.apply(proxy, %Impairment{rate_kbps: 700, queue_ms: 200, delay_ms: 10})
 
 # A publisher on a thin uplink; the direction left out keeps its setting.
-:ok = ChaosProxy.apply(proxy, up: %Impairment{rate_kbps: 500, loss_pct: 1.0})
+:ok = ChaosProxy.apply(proxy, up: %Impairment{rate_kbps: 500, loss_pct: 1})
 
 %{seconds: seconds, totals: %{up: up, down: down}, clients: 1} = ChaosProxy.report(proxy)
 ```

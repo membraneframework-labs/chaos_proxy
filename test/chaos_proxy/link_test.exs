@@ -41,7 +41,7 @@ defmodule ChaosProxy.LinkTest do
 
   test "loss is seeded" do
     losses = fn seed ->
-      link = Link.new(%Impairment{loss_pct: 30.0}, seed, 0)
+      link = Link.new(%Impairment{loss_pct: 30}, seed, 0)
       {outcomes, _link} = burst(link, 200, 0)
       Enum.count(outcomes, &(&1 == :lost))
     end

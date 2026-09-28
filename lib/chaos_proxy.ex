@@ -1,42 +1,67 @@
 defmodule ChaosProxy do
   @moduledoc """
-  Seeded UDP forwarder between clients and one upstream (a MoQ relay, in both
-  current users), degrading the upstream -> client direction like a bottleneck
-  link: a token bucket at the configured rate feeding a bounded FIFO with tail
-  drop, optional random loss, a fixed one-way delay in both directions, and
-  blackouts that drop everything both ways.
+  A seeded UDP forwarder between clients and one upstream that behaves like a
+  bad link, shaping each direction on its own.
+
+      client  ──up──▶  proxy  ──▶  upstream
+      client  ◀─down─  proxy  ◀──  upstream
+
+  Each direction is a `ChaosProxy.Link` with its own `ChaosProxy.Impairment`:
+  blackout, random loss, a token bucket feeding a tail-drop queue, then a
+  fixed delay. Clients are whoever sends to the proxy's port; each gets its
+  own upstream socket, so the upstream sees one peer per client. Both
+  directions are shared by all clients, as one access link in front of them
+  would be; a bottleneck per client takes a proxy per client.
+
+  It knows nothing about what it carries. QUIC is encrypted and addressed by
+  connection ID, so forwarding datagrams is transparent to it.
+
+      {:ok, proxy} = ChaosProxy.start_link(upstream_port: 4443, seed: 7)
+      port = ChaosProxy.port(proxy)
+
+      # the downlink only, its delay and blackout mirrored on the uplink
+      :ok = ChaosProxy.apply(proxy, %ChaosProxy.Impairment{rate_kbps: 700, delay_ms: 10})
+
+      # each direction on its own, e.g. a thin uplink in front of a publisher
+      :ok = ChaosProxy.apply(proxy, up: %ChaosProxy.Impairment{rate_kbps: 500}, down: %ChaosProxy.Impairment{})
 
   Every random decision comes from a PRNG seeded at start, so the losses of a
   run repeat (packet timing does not, so a repeat is close, not identical).
-  Counters are kept per second, so a caller can tell which windows were
-  congested, and cumulatively.
-
-  QUIC is encrypted and addressed by connection ID, so datagram forwarding is
-  transparent to it; the proxy sees bytes, never what they carry.
+  Counters are kept per direction, per second and in total (`report/1`).
 
   ## Options
 
-    * `:relay_port` (required), `:relay_host` (default `"127.0.0.1"`) - the upstream
+    * `:upstream_port` (required), `:upstream_host` (default `"127.0.0.1"`) -
+      a host name or an IPv4 or IPv6 address
+    * `:listen_ip` - address clients send to, default `{127, 0, 0, 1}`
     * `:listen_port` - default 0, read it back with `port/1`
-    * `:impairment` - the initial `ChaosProxy.Impairment`
+    * `:impairment` - the initial one, in any form `apply/2` takes; default
+      transparent
     * `:seed` - PRNG seed, default 0
-    * `:history` - how many per-second buckets `report/1` keeps, default
-      `:infinity`; bound it in a long-running process
+    * `:history` - how many per-second buckets `report/1` keeps, default 300;
+      `:infinity` keeps them all
     * `:client_idle_ms` - a client silent this long in both directions is
       forgotten and its upstream socket closed, default 60 000; `:infinity`
       keeps every client
     * `:name` - registered name, optional
+
+  ## Fidelity
+
+  One process forwards everything, delays are `Process.send_after/3` timers
+  and the bucket is paced by them, so timing has millisecond granularity and
+  throughput is bounded by what one process can forward (see the README).
+  There is no jitter, reordering, duplication or corruption.
   """
 
   use GenServer
 
-  alias ChaosProxy.Impairment
+  alias ChaosProxy.{Impairment, Link}
 
-  @mtu 1500
   @bucket_ms 1_000
 
-  @type second :: %{
-          second: non_neg_integer(),
+  @type direction :: :up | :down
+
+  @type counters :: %{
           offered_bytes: non_neg_integer(),
           forwarded_bytes: non_neg_integer(),
           dropped_packets: non_neg_integer(),
@@ -45,63 +70,74 @@ defmodule ChaosProxy do
           queue_bytes_max: non_neg_integer()
         }
 
-  def start_link(opts) do
-    case Keyword.fetch(opts, :name) do
-      {:ok, name} -> GenServer.start_link(__MODULE__, opts, name: name)
-      :error -> GenServer.start_link(__MODULE__, opts)
-    end
-  end
+  @type second :: %{second: non_neg_integer(), up: counters(), down: counters()}
 
-  @doc "The UDP port clients connect to."
+  @type impairments ::
+          Impairment.t() | [{:up, Impairment.t()} | {:down, Impairment.t()}]
+
+  @spec start_link(keyword()) :: GenServer.on_start()
+  def start_link(opts), do: GenServer.start_link(__MODULE__, opts, Keyword.take(opts, [:name]))
+
+  @doc "The UDP port clients send to."
   @spec port(GenServer.server()) :: :inet.port_number()
   def port(proxy), do: GenServer.call(proxy, :port)
 
-  @spec apply(GenServer.server(), Impairment.t()) :: :ok
-  def apply(proxy, %Impairment{} = impairment), do: GenServer.call(proxy, {:apply, impairment})
+  @doc """
+  Changes the impairments. A keyword list with `:up` and/or `:down` sets
+  those directions and leaves the other as it is. A bare `Impairment` sets
+  the downlink and gives the uplink only its `delay_ms` and `blackout?`, a
+  bottleneck in front of the clients with the delay of the path back.
+  """
+  @spec apply(GenServer.server(), impairments()) :: :ok
+  def apply(proxy, impairments), do: GenServer.call(proxy, {:apply, split(impairments)})
 
   @doc """
-  Per-second counters, oldest first (the last `:history` of them, the current
-  second included), totals since start, and the number of live clients.
+  Per-second counters for each direction, oldest first (the last `:history`
+  of them, the current second included), totals since start, and the number
+  of live clients.
   """
   @spec report(GenServer.server()) :: %{
           seconds: [second()],
-          totals: map(),
+          totals: %{up: counters(), down: counters()},
           clients: non_neg_integer()
         }
   def report(proxy), do: GenServer.call(proxy, :report)
 
   @impl true
   def init(opts) do
+    listen_ip = Keyword.get(opts, :listen_ip, {127, 0, 0, 1})
+
     {:ok, listen} =
       :gen_udp.open(Keyword.get(opts, :listen_port, 0), [
         :binary,
+        family(listen_ip),
         active: true,
-        ip: {127, 0, 0, 1},
+        ip: listen_ip,
         recbuf: 4_000_000
       ])
 
-    {:ok, relay_ip} =
-      :inet.getaddr(to_charlist(Keyword.get(opts, :relay_host, "127.0.0.1")), :inet)
-
+    upstream_ip = resolve!(Keyword.get(opts, :upstream_host, "127.0.0.1"))
     seed = Keyword.get(opts, :seed, 0)
+    now = now_ms()
+
+    %{up: up, down: down} =
+      Map.merge(
+        %{up: %Impairment{}, down: %Impairment{}},
+        split(Keyword.get(opts, :impairment, []))
+      )
 
     {:ok,
      %{
        listen: listen,
-       relay: {relay_ip, Keyword.fetch!(opts, :relay_port)},
-       config: Keyword.get(opts, :impairment, %Impairment{}),
-       rng: :rand.seed_s(:exsss, {seed, seed + 1, seed + 2}),
-       started_at: now_ms(),
-       history: Keyword.get(opts, :history, :infinity),
+       upstream: {upstream_ip, Keyword.fetch!(opts, :upstream_port)},
+       links: %{down: Link.new(down, seed, now), up: Link.new(up, seed + 3, now)},
+       drain_timers: %{up: nil, down: nil},
+       started_at: now,
+       history: Keyword.get(opts, :history, 300),
        client_idle_ms: Keyword.get(opts, :client_idle_ms, 60_000),
-       totals: Map.delete(empty_second(0), :second),
+       totals: %{up: empty_counters(), down: empty_counters()},
        clients: %{},
        upstreams: %{},
-       queue: :queue.new(),
-       queue_bytes: 0,
-       tokens: 0.0,
-       refilled_at: now_ms(),
-       drain_timer: nil,
        current: nil,
        seconds: []
      }}
@@ -113,10 +149,17 @@ defmodule ChaosProxy do
     {:reply, port, state}
   end
 
-  def handle_call({:apply, config}, _from, state) do
-    state = %{refill(state) | config: config}
-    state = %{state | tokens: min(state.tokens, burst_bytes(config))}
-    {:reply, :ok, drain(state)}
+  def handle_call({:apply, impairments}, _from, state) do
+    now = now_ms()
+
+    state =
+      Enum.reduce(impairments, state, fn {direction, impairment}, state ->
+        state
+        |> update_in([:links, direction], &Link.apply(&1, impairment, now))
+        |> drain(direction)
+      end)
+
+    {:reply, :ok, state}
   end
 
   def handle_call(:report, _from, state) do
@@ -125,7 +168,6 @@ defmodule ChaosProxy do
     {:reply, %{seconds: seconds, totals: state.totals, clients: map_size(state.clients)}, state}
   end
 
-  # Uplink (client -> upstream): never shaped, only delayed, or lost in a blackout.
   @impl true
   def handle_info({:udp, listen, ip, port, data}, %{listen: listen} = state) do
     client = {ip, port}
@@ -136,38 +178,20 @@ defmodule ChaosProxy do
           {upstream, state}
 
         _none ->
-          {:ok, upstream} = :gen_udp.open(0, [:binary, active: true, ip: {127, 0, 0, 1}])
-
+          {upstream_ip, _port} = state.upstream
+          {:ok, upstream} = :gen_udp.open(0, [:binary, family(upstream_ip), active: true])
           {upstream, %{state | upstreams: Map.put(state.upstreams, upstream, client)}}
       end
 
     state = touch(state, client, upstream)
-
-    if state.config.blackout? do
-      {:noreply, count(state, :blackout_packets, 1)}
-    else
-      later(state.config, {:to_relay, upstream, data})
-      {:noreply, state}
-    end
+    {:noreply, offer(state, :up, {upstream, data}, byte_size(data))}
   end
 
-  # Downlink (upstream -> client): blackout, random loss, then shaping.
   def handle_info({:udp, upstream, _ip, _port, data}, state) do
     case state.upstreams do
       %{^upstream => client} ->
-        state = state |> touch(client, upstream) |> count(:offered_bytes, byte_size(data))
-
-        cond do
-          state.config.blackout? ->
-            {:noreply, count(state, :blackout_packets, 1)}
-
-          true ->
-            {lost?, state} = lost?(state)
-
-            if lost?,
-              do: {:noreply, count(state, :lost_packets, 1)},
-              else: {:noreply, shape(client, data, state)}
-        end
+        state = touch(state, client, upstream)
+        {:noreply, offer(state, :down, {client, data}, byte_size(data))}
 
       # Left in the mailbox by a socket closed for an expired client.
       _expired ->
@@ -175,102 +199,77 @@ defmodule ChaosProxy do
     end
   end
 
-  # The socket may have been closed for an expired client while this was delayed.
-  def handle_info({:to_relay, upstream, data}, state) do
-    {ip, port} = state.relay
-    _ = :gen_udp.send(upstream, ip, port, data)
+  # The upstream socket may have been closed for an expired client meanwhile.
+  def handle_info({:deliver, :up, {upstream, data}}, state) do
+    {ip, port} = state.upstream
+    _result = :gen_udp.send(upstream, ip, port, data)
     {:noreply, state}
   end
 
-  def handle_info({:to_client, {ip, port}, data}, state) do
-    :ok = :gen_udp.send(state.listen, ip, port, data)
+  def handle_info({:deliver, :down, {{ip, port}, data}}, state) do
+    _result = :gen_udp.send(state.listen, ip, port, data)
     {:noreply, state}
   end
 
-  def handle_info(:drain, state), do: {:noreply, drain(%{state | drain_timer: nil})}
+  def handle_info({:drain, direction}, state) do
+    {:noreply, drain(put_in(state.drain_timers[direction], nil), direction)}
+  end
 
-  defp shape(client, data, state) do
-    size = byte_size(data)
+  defp offer(state, direction, packet, size) do
+    state = count(state, direction, :offered_bytes, size)
+    {outcome, link} = Link.offer(state.links[direction], packet, size, now_ms())
+    state = put_in(state.links[direction], link)
 
-    if state.queue_bytes + size > queue_cap_bytes(state.config) do
-      count(state, :dropped_packets, 1)
+    case outcome do
+      :queued -> state |> count(direction, :queue_bytes_max, 0) |> drain(direction)
+      :blackout -> count(state, direction, :blackout_packets, 1)
+      :lost -> count(state, direction, :lost_packets, 1)
+      :dropped -> count(state, direction, :dropped_packets, 1)
+    end
+  end
+
+  defp drain(state, direction) do
+    {released, link, wait_ms} = Link.drain(state.links[direction], now_ms())
+    state = put_in(state.links[direction], link)
+    delay = link.impairment.delay_ms
+
+    state =
+      Enum.reduce(released, state, fn {_to, data} = packet, state ->
+        later(delay, {:deliver, direction, packet})
+        count(state, direction, :forwarded_bytes, byte_size(data))
+      end)
+
+    if wait_ms != nil and state.drain_timers[direction] == nil do
+      timer = Process.send_after(self(), {:drain, direction}, wait_ms)
+      put_in(state.drain_timers[direction], timer)
     else
-      state = %{
-        state
-        | queue: :queue.in({client, data}, state.queue),
-          queue_bytes: state.queue_bytes + size
-      }
-
-      state |> count(:queue_bytes_max, 0) |> drain()
+      state
     end
   end
 
-  defp drain(state) do
-    state = refill(state)
+  defp later(0, message), do: send(self(), message)
+  defp later(delay, message), do: Process.send_after(self(), message, delay)
 
-    case :queue.out(state.queue) do
-      {:empty, _queue} ->
-        state
+  defp split(%Impairment{} = down),
+    do: %{down: down, up: %Impairment{delay_ms: down.delay_ms, blackout?: down.blackout?}}
 
-      {{:value, {client, data}}, rest} ->
-        size = byte_size(data)
+  defp split(impairments) when is_list(impairments), do: Map.new(impairments)
 
-        cond do
-          state.tokens >= size ->
-            state = %{
-              state
-              | queue: rest,
-                queue_bytes: state.queue_bytes - size,
-                tokens: state.tokens - size
-            }
+  defp resolve!(ip) when is_tuple(ip), do: ip
 
-            drain(deliver(client, data, state))
+  defp resolve!(host) do
+    host = to_charlist(host)
 
-          state.drain_timer != nil ->
-            state
-
-          true ->
-            wait_ms = ceil((size - state.tokens) / bytes_per_ms(state.config))
-            %{state | drain_timer: Process.send_after(self(), :drain, max(wait_ms, 1))}
-        end
+    with {:error, _v4} <- :inet.getaddr(host, :inet),
+         {:error, reason} <- :inet.getaddr(host, :inet6) do
+      raise ArgumentError, "cannot resolve upstream #{host}: #{inspect(reason)}"
+    else
+      {:ok, ip} -> ip
     end
   end
 
-  defp deliver(client, data, state) do
-    later(state.config, {:to_client, client, data})
-    count(state, :forwarded_bytes, byte_size(data))
-  end
-
-  defp later(%Impairment{delay_ms: 0}, message), do: send(self(), message)
-
-  defp later(%Impairment{delay_ms: delay}, message),
-    do: Process.send_after(self(), message, delay)
-
-  defp lost?(%{config: %Impairment{loss_pct: pct}} = state) when pct <= 0, do: {false, state}
-
-  defp lost?(%{config: %Impairment{loss_pct: pct}, rng: rng} = state) do
-    {x, rng} = :rand.uniform_s(rng)
-    {x * 100 < pct, %{state | rng: rng}}
-  end
-
-  defp refill(state) do
-    now = now_ms()
-    config = state.config
-
-    tokens =
-      min(state.tokens + (now - state.refilled_at) * bytes_per_ms(config), burst_bytes(config))
-
-    %{state | tokens: tokens, refilled_at: now}
-  end
-
-  defp bytes_per_ms(%Impairment{rate_kbps: rate}), do: rate / 8
-
-  # Enough for a few full packets, or 20 ms worth at the rate, whichever is larger.
-  defp burst_bytes(config), do: max(3 * @mtu, bytes_per_ms(config) * 20)
-
-  # `queue_ms` of queueing before tail drop, but never fewer than 8 packets.
-  defp queue_cap_bytes(%Impairment{queue_ms: queue_ms} = config),
-    do: max(8 * @mtu, round(bytes_per_ms(config) * queue_ms))
+  defp family(ip) when tuple_size(ip) == 8, do: :inet6
+  defp family(_ip), do: :inet
 
   defp now_ms, do: System.monotonic_time(:microsecond) / 1_000
 
@@ -300,16 +299,22 @@ defmodule ChaosProxy do
 
   ## Counters
 
-  defp count(state, key, amount) do
+  defp count(state, direction, key, amount) do
     state = rotate(state)
 
     bump =
       case key do
-        :queue_bytes_max -> &Map.update!(&1, key, fn peak -> max(peak, state.queue_bytes) end)
-        _ -> &Map.update!(&1, key, fn sum -> sum + amount end)
+        :queue_bytes_max ->
+          queued = Link.queue_bytes(state.links[direction])
+          &Map.update!(&1, key, fn peak -> max(peak, queued) end)
+
+        _sum ->
+          &Map.update!(&1, key, fn sum -> sum + amount end)
       end
 
-    %{state | current: bump.(state.current), totals: bump.(state.totals)}
+    state
+    |> update_in([:current, direction], bump)
+    |> update_in([:totals, direction], bump)
   end
 
   # Moves on to the current second's bucket, archiving the previous one.
@@ -317,11 +322,11 @@ defmodule ChaosProxy do
     second = trunc((now_ms() - state.started_at) / @bucket_ms)
 
     case state.current do
-      nil ->
-        %{state | current: empty_second(second)}
-
       %{second: ^second} ->
         state
+
+      nil ->
+        %{state | current: empty_second(second)}
 
       current ->
         expire_clients(%{state | seconds: keep(current, state), current: empty_second(second)})
@@ -331,9 +336,10 @@ defmodule ChaosProxy do
   defp keep(second, %{history: :infinity, seconds: seconds}), do: [second | seconds]
   defp keep(second, %{history: n, seconds: seconds}), do: Enum.take([second | seconds], n - 1)
 
-  defp empty_second(second),
+  defp empty_second(second), do: %{second: second, up: empty_counters(), down: empty_counters()}
+
+  defp empty_counters,
     do: %{
-      second: second,
       offered_bytes: 0,
       forwarded_bytes: 0,
       dropped_packets: 0,

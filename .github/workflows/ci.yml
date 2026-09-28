@@ -1,0 +1,17 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build_test:
+    uses: membraneframework/membrane_actions/.github/workflows/build-test.yml@main
+
+  lint:
+    uses: membraneframework/membrane_actions/.github/workflows/lint.yml@main
+
+  test:
+    uses: membraneframework/membrane_actions/.github/workflows/test.yml@main

@@ -16,7 +16,8 @@ defmodule ChaosProxy do
   It knows nothing about what it carries. QUIC is encrypted and addressed by
   connection ID, so forwarding datagrams is transparent to it.
 
-      {:ok, proxy} = ChaosProxy.start_link(upstream_port: 4443, seed: 7)
+      config = ChaosProxy.Config.new!(upstream_port: 4443, seed: 7)
+      {:ok, proxy} = ChaosProxy.start_link(config)
       port = ChaosProxy.port(proxy)
 
       # the downlink only, its delay and blackout mirrored on the uplink
@@ -29,25 +30,7 @@ defmodule ChaosProxy do
   run repeat (packet timing does not, so a repeat is close, not identical).
   Counters are kept per direction, per second and in total (`report/1`).
 
-  ## Options
-
-    * `:upstream_port` (required), `:upstream_host` (default `"127.0.0.1"`) -
-      a host name or an IPv4 or IPv6 address
-    * `:listen_ip` - address clients send to, default `{127, 0, 0, 1}`
-    * `:listen_port` - default 0, read it back with `port/1`
-    * `:impairment` - the initial one, in any form `apply/2` takes; default
-      transparent
-    * `:seed` - PRNG seed, default 0
-    * `:history` - how many per-second buckets `report/1` keeps, default 300;
-      `:infinity` keeps them all
-    * `:client_idle_ms` - a client silent this long in both directions is
-      forgotten and its upstream socket closed, default 60 000; `:infinity`
-      keeps every client
-    * `:max_clients` - how many clients the proxy keeps at once, default
-      `:infinity`. Beyond it, idle ones are forgotten first; if none is, a new
-      client's packets are dropped and counted as `refused_packets`. Each
-      client holds an upstream socket, so a proxy on a public port wants one.
-    * `:name` - registered name, optional
+  The options are documented in `ChaosProxy.Config`.
 
   ## Fidelity
 
@@ -60,7 +43,7 @@ defmodule ChaosProxy do
 
   use GenServer
 
-  alias ChaosProxy.{Impairment, Link}
+  alias ChaosProxy.{Config, Impairment, Link}
 
   @bucket_ms 1_000
 
@@ -98,7 +81,7 @@ defmodule ChaosProxy do
   defmodule State do
     @moduledoc false
 
-    alias ChaosProxy.Link
+    alias ChaosProxy.{Config, Link}
 
     @type client :: {:inet.ip_address(), :inet.port_number()}
 
@@ -109,16 +92,13 @@ defmodule ChaosProxy do
     @type per_direction(value) :: %{up: value, down: value}
 
     @type t :: %__MODULE__{
+            config: Config.t(),
             listen: :gen_udp.socket(),
-            upstream: {:inet.ip_address(), :inet.port_number()},
             links: per_direction(Link.t()),
             drain_timers: per_direction(reference() | nil),
             delayed: per_direction(:queue.queue({number(), packet()})),
             delay_timers: per_direction(reference() | nil),
             started_at: float(),
-            history: pos_integer() | :infinity,
-            client_idle_ms: non_neg_integer() | :infinity,
-            max_clients: pos_integer() | :infinity,
             totals: per_direction(ChaosProxy.counters()),
             clients: %{client() => %{socket: :gen_udp.socket(), seen_ms: float()}},
             upstreams: %{:gen_udp.socket() => client()},
@@ -126,16 +106,7 @@ defmodule ChaosProxy do
             seconds: [ChaosProxy.second()]
           }
 
-    @enforce_keys [
-      :listen,
-      :upstream,
-      :links,
-      :started_at,
-      :history,
-      :client_idle_ms,
-      :max_clients,
-      :totals
-    ]
+    @enforce_keys [:config, :listen, :links, :started_at, :totals]
     defstruct @enforce_keys ++
                 [
                   drain_timers: %{up: nil, down: nil},
@@ -151,8 +122,16 @@ defmodule ChaosProxy do
   @typep client :: State.client()
   @typep packet :: State.packet()
 
-  @spec start_link(keyword()) :: GenServer.on_start()
-  def start_link(opts), do: GenServer.start_link(__MODULE__, opts, Keyword.take(opts, [:name]))
+  @spec child_spec(Config.t()) :: Supervisor.child_spec()
+  def child_spec(%Config{} = config) do
+    %{id: __MODULE__, start: {__MODULE__, :start_link, [config]}, type: :worker}
+  end
+
+  @spec start_link(Config.t()) :: GenServer.on_start()
+  def start_link(%Config{} = config) do
+    opts = if config.name, do: [name: config.name], else: []
+    GenServer.start_link(__MODULE__, config, opts)
+  end
 
   @doc "The UDP port clients send to."
   @spec port(GenServer.server()) :: :inet.port_number()
@@ -180,37 +159,30 @@ defmodule ChaosProxy do
   def report(proxy), do: GenServer.call(proxy, :report)
 
   @impl true
-  def init(opts) do
-    listen_ip = Keyword.get(opts, :listen_ip, {127, 0, 0, 1})
-
+  def init(%Config{} = config) do
     {:ok, listen} =
-      :gen_udp.open(Keyword.get(opts, :listen_port, 0), [
+      :gen_udp.open(config.listen_port, [
         :binary,
-        family(listen_ip),
+        family(config.listen_ip),
         active: true,
-        ip: listen_ip,
+        ip: config.listen_ip,
         recbuf: @recbuf
       ])
 
-    upstream_ip = resolve!(Keyword.get(opts, :upstream_host, "127.0.0.1"))
-    seed = Keyword.get(opts, :seed, 0)
     now = now_ms()
 
     %{up: up, down: down} =
-      Map.merge(
-        %{up: %Impairment{}, down: %Impairment{}},
-        split(Keyword.get(opts, :impairment, []))
-      )
+      Map.merge(%{up: %Impairment{}, down: %Impairment{}}, split(config.impairment))
 
     {:ok,
      %State{
+       config: config,
        listen: listen,
-       upstream: {upstream_ip, Keyword.fetch!(opts, :upstream_port)},
-       links: %{down: Link.new(down, seed, now), up: Link.new(up, seed + 3, now)},
+       links: %{
+         down: Link.new(down, config.seed, now),
+         up: Link.new(up, config.seed + 3, now)
+       },
        started_at: now,
-       history: Keyword.get(opts, :history, 300),
-       client_idle_ms: Keyword.get(opts, :client_idle_ms, 60_000),
-       max_clients: Keyword.get(opts, :max_clients, :infinity),
        totals: %{up: empty_counters(), down: empty_counters()}
      }}
   end
@@ -341,7 +313,7 @@ defmodule ChaosProxy do
   # The upstream socket may have been closed for an expired client meanwhile.
   @spec deliver(State.t(), direction(), packet()) :: :ok | {:error, term()}
   defp deliver(state, :up, {upstream, data}) do
-    {ip, port} = state.upstream
+    %Config{upstream_host: ip, upstream_port: port} = state.config
     _result = :gen_udp.send(upstream, ip, port, data)
   end
 
@@ -363,10 +335,13 @@ defmodule ChaosProxy do
         if full?(state) do
           {:full, state}
         else
-          {upstream_ip, _port} = state.upstream
-
           {:ok, upstream} =
-            :gen_udp.open(0, [:binary, family(upstream_ip), active: true, recbuf: @recbuf])
+            :gen_udp.open(0, [
+              :binary,
+              family(state.config.upstream_host),
+              active: true,
+              recbuf: @recbuf
+            ])
 
           {:ok, upstream, %{state | upstreams: Map.put(state.upstreams, upstream, client)}}
         end
@@ -374,28 +349,14 @@ defmodule ChaosProxy do
   end
 
   @spec full?(State.t()) :: boolean()
-  defp full?(%State{max_clients: :infinity}), do: false
-  defp full?(state), do: map_size(state.clients) >= state.max_clients
+  defp full?(%State{config: %Config{max_clients: :infinity}}), do: false
+  defp full?(state), do: map_size(state.clients) >= state.config.max_clients
 
   @spec split(impairments()) :: %{optional(direction()) => Impairment.t()}
   defp split(%Impairment{} = down),
     do: %{down: down, up: %Impairment{delay_ms: down.delay_ms, blackout?: down.blackout?}}
 
   defp split(impairments) when is_list(impairments), do: Map.new(impairments)
-
-  @spec resolve!(:inet.ip_address() | :inet.hostname() | String.t()) :: :inet.ip_address()
-  defp resolve!(ip) when is_tuple(ip), do: ip
-
-  defp resolve!(host) do
-    host = to_charlist(host)
-
-    with {:error, _v4} <- :inet.getaddr(host, :inet),
-         {:error, reason} <- :inet.getaddr(host, :inet6) do
-      raise ArgumentError, "cannot resolve upstream #{host}: #{inspect(reason)}"
-    else
-      {:ok, ip} -> ip
-    end
-  end
 
   @spec family(:inet.ip_address()) :: :inet | :inet6
   defp family(ip) when tuple_size(ip) == 8, do: :inet6
@@ -413,10 +374,10 @@ defmodule ChaosProxy do
   # A client that went away leaves its upstream socket behind; checked when a
   # second rolls over and on `report/1`.
   @spec expire_clients(State.t()) :: State.t()
-  defp expire_clients(%State{client_idle_ms: :infinity} = state), do: state
+  defp expire_clients(%State{config: %Config{client_idle_ms: :infinity}} = state), do: state
 
   defp expire_clients(state) do
-    cutoff = now_ms() - state.client_idle_ms
+    cutoff = now_ms() - state.config.client_idle_ms
 
     {idle, live} =
       Map.split_with(state.clients, fn {_client, %{seen_ms: seen}} -> seen < cutoff end)
@@ -468,9 +429,10 @@ defmodule ChaosProxy do
   end
 
   @spec keep(second(), State.t()) :: [second()]
-  defp keep(second, %State{history: :infinity, seconds: seconds}), do: [second | seconds]
+  defp keep(second, %State{config: %Config{history: :infinity}, seconds: seconds}),
+    do: [second | seconds]
 
-  defp keep(second, %State{history: n, seconds: seconds}),
+  defp keep(second, %State{config: %Config{history: n}, seconds: seconds}),
     do: Enum.take([second | seconds], n - 1)
 
   @spec empty_second(non_neg_integer()) :: second()

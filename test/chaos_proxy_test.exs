@@ -1,7 +1,7 @@
 defmodule ChaosProxyTest do
   use ExUnit.Case, async: true
 
-  alias ChaosProxy.Impairment
+  alias ChaosProxy.{Config, Impairment}
 
   # Large enough for a burst released on one timer tick; the default is small
   # on macOS.
@@ -35,7 +35,8 @@ defmodule ChaosProxyTest do
   end
 
   defp start(opts \\ []) do
-    {:ok, proxy} = ChaosProxy.start_link([upstream_port: echo_server(), seed: 1] ++ opts)
+    config = Config.new!([upstream_port: echo_server(), seed: 1] ++ opts)
+    {:ok, proxy} = ChaosProxy.start_link(config)
     {proxy, ChaosProxy.port(proxy)}
   end
 
@@ -108,7 +109,8 @@ defmodule ChaosProxyTest do
       :gen_udp.open(0, [:binary, :inet6, active: true, ip: {0, 0, 0, 0, 0, 0, 0, 1}])
 
     {:ok, upstream_port} = :inet.port(upstream)
-    {:ok, proxy} = ChaosProxy.start_link(upstream_host: "::1", upstream_port: upstream_port)
+    config = Config.new!(upstream_host: "::1", upstream_port: upstream_port)
+    {:ok, proxy} = ChaosProxy.start_link(config)
     port = ChaosProxy.port(proxy)
 
     :ok = :gen_udp.send(client(), {127, 0, 0, 1}, port, "v6")
@@ -160,6 +162,15 @@ defmodule ChaosProxyTest do
       end
 
     assert received == Enum.to_list(1..2_000)
+  end
+
+  test "registers under the config's name and runs under a supervisor" do
+    name = :"proxy_#{System.unique_integer([:positive])}"
+    config = Config.new!(upstream_port: echo_server(), name: name)
+    proxy = start_supervised!({ChaosProxy, config})
+
+    assert Process.whereis(name) == proxy
+    assert ChaosProxy.port(name) in 1..65_535
   end
 
   test "history bounds the per-second buckets but not the totals" do

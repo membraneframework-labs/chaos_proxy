@@ -30,9 +30,10 @@ end
 ## Usage
 
 ```elixir
-alias ChaosProxy.Impairment
+alias ChaosProxy.{Config, Impairment}
 
-{:ok, proxy} = ChaosProxy.start_link(upstream_host: "127.0.0.1", upstream_port: 4443, seed: 7)
+config = Config.new!(upstream_host: "127.0.0.1", upstream_port: 4443, seed: 7)
+{:ok, proxy} = ChaosProxy.start_link(config)
 port = ChaosProxy.port(proxy)   # point the clients here
 
 # A bottleneck in front of subscribers: the downlink is shaped, its delay and
@@ -64,7 +65,7 @@ queue.
 `ChaosProxy.Link` is the shaper on its own, as plain data with the time passed
 in, for driving it from a simulation or a test without sockets.
 
-The options are documented in `ChaosProxy`.
+The options are documented in `ChaosProxy.Config`.
 
 ## Fidelity
 

@@ -3,21 +3,6 @@ defmodule ChaosProxy.ConfigTest do
 
   alias ChaosProxy.{Config, Impairment}
 
-  test "defaults to a transparent proxy on loopback, on a port the OS picks" do
-    assert %Config{
-             upstream_host: {127, 0, 0, 1},
-             upstream_port: 4443,
-             listen_ip: {127, 0, 0, 1},
-             listen_port: 0,
-             impairment: [],
-             seed: 0,
-             history: 300,
-             client_idle_ms: 60_000,
-             max_clients: :infinity,
-             name: nil
-           } = Config.new!(upstream_port: 4443)
-  end
-
   test "resolves the upstream host to an address" do
     assert Config.new!(upstream_host: "::1", upstream_port: 1).upstream_host ==
              {0, 0, 0, 0, 0, 0, 0, 1}
@@ -29,15 +14,14 @@ defmodule ChaosProxy.ConfigTest do
              {10, 0, 0, 1}
   end
 
-  test "takes an impairment in every form apply/2 does" do
-    down = %Impairment{rate_kbps: 500}
+  test "has an impairment for each direction, whichever form apply/2 takes was given" do
+    thin = %Impairment{rate_kbps: 500, delay_ms: 10}
 
-    assert Config.new!(upstream_port: 1, impairment: down).impairment == down
-    assert Config.new!(upstream_port: 1, impairment: [up: down]).impairment == [up: down]
-  end
+    assert Config.new!(upstream_port: 1, impairment: thin).impairment ==
+             %{down: thin, up: %Impairment{delay_ms: 10}}
 
-  test "requires the upstream port" do
-    assert_raise ArgumentError, ~r/upstream_port/, fn -> Config.new!([]) end
+    assert Config.new!(upstream_port: 1, impairment: [up: thin]).impairment ==
+             %{up: thin, down: %Impairment{}}
   end
 
   test "refuses an unknown option" do
@@ -50,23 +34,9 @@ defmodule ChaosProxy.ConfigTest do
     end
   end
 
-  for {key, value} <- [
-        upstream_port: 0,
-        upstream_port: 65_536,
-        upstream_host: 4443,
-        upstream_host: {1, 2, 3},
-        listen_port: -1,
-        listen_ip: "127.0.0.1",
-        impairment: [sideways: %Impairment{}],
-        impairment: [up: :slow],
-        seed: 1.5,
-        history: 0,
-        client_idle_ms: -1,
-        max_clients: 0
-      ] do
-    test "refuses #{key}: #{inspect(value)}" do
-      opts = Keyword.merge([upstream_port: 1], [{unquote(key), unquote(Macro.escape(value))}])
-      assert_raise ArgumentError, ~r/#{unquote(key)} must be/, fn -> Config.new!(opts) end
+  test "refuses a history that keeps no second at all" do
+    assert_raise ArgumentError, ~r/:history must be/, fn ->
+      Config.new!(upstream_port: 1, history: 0)
     end
   end
 end

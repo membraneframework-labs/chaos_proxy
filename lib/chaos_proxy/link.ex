@@ -1,20 +1,15 @@
 defmodule ChaosProxy.Link do
   @moduledoc """
-  One direction of a `ChaosProxy` as plain data: blackout and random loss on
-  the way in, then a token bucket draining a FIFO with tail drop. It holds
-  packets, never sends them.
+  One direction of a `ChaosProxy` on its own, as plain data. It applies a
+  `ChaosProxy.Impairment` to the packets it is offered and holds them until
+  they may leave; it never sends them.
 
-  Time is passed in as milliseconds on any monotonic clock, so a link can be
-  driven and tested without timers. `delay_ms` is not applied here: the
-  caller holds each packet that `drain/2` releases for that long.
+  Time is an argument, in milliseconds on any monotonic clock, so a link can
+  be driven by a simulation or a test.
 
-      link = Link.new(%Impairment{rate_kbps: 800}, 7, now)
-      {:queued, link} = Link.offer(link, packet, byte_size(data), now)
-      {released, link, wait_ms} = Link.drain(link, now)
-
-  The bucket holds 20 ms worth of the rate, but never less than three
-  1500-byte packets, and the queue `queue_ms` worth, but never less than eight
-  such packets, so that a very low rate still passes full-size datagrams.
+      link = Link.new(%Impairment{rate_kbps: 800, delay_ms: 20}, 7, now)
+      {:queued, link} = Link.offer(link, packet, byte_size(data))
+      {leaving, link, wait_ms} = Link.drain(link, now)
   """
 
   alias ChaosProxy.Impairment
@@ -22,6 +17,10 @@ defmodule ChaosProxy.Link do
   @mtu 1500
 
   @type packet :: term()
+  @typedoc """
+  What became of an offered packet: it is held (`:queued`), or gone to a
+  blackout, to random loss or for want of room in the queue (`:dropped`).
+  """
   @type outcome :: :blackout | :lost | :dropped | :queued
 
   @type t :: %__MODULE__{
@@ -29,27 +28,29 @@ defmodule ChaosProxy.Link do
           rng: :rand.state(),
           queue: :queue.queue({packet(), non_neg_integer()}),
           queue_bytes: non_neg_integer(),
-          tokens: float(),
-          refilled_at: number()
+          tokens: number(),
+          refilled_at: number(),
+          delayed: :queue.queue({due :: number(), packet()})
         }
 
-  @enforce_keys [:impairment, :rng, :queue, :refilled_at]
-  defstruct [:impairment, :rng, :queue, :refilled_at, queue_bytes: 0, tokens: 0.0]
+  @enforce_keys [:impairment, :rng, :queue, :delayed, :refilled_at]
+  defstruct @enforce_keys ++ [queue_bytes: 0, tokens: 0.0]
 
-  @doc "A link with an empty queue and bucket; `seed` makes its losses repeatable."
+  @doc "A link holding nothing. `seed` makes its losses repeatable."
   @spec new(Impairment.t(), integer(), number()) :: t()
   def new(%Impairment{} = impairment, seed, now) do
     %__MODULE__{
       impairment: impairment,
       rng: :rand.seed_s(:exsss, {seed, seed + 1, seed + 2}),
       queue: :queue.new(),
+      delayed: :queue.new(),
       refilled_at: now
     }
   end
 
   @doc """
-  Changes the knobs. Queued packets stay and drain at the new rate; call
-  `drain/2` afterwards.
+  Changes the impairment. Call `drain/2` afterwards: packets it holds may
+  leave sooner.
   """
   @spec apply(t(), Impairment.t(), number()) :: t()
   def apply(link, %Impairment{} = impairment, now) do
@@ -58,11 +59,11 @@ defmodule ChaosProxy.Link do
   end
 
   @doc "Takes a packet of `size` bytes in, or says why not."
-  @spec offer(t(), packet(), non_neg_integer(), number()) :: {outcome(), t()}
-  def offer(%__MODULE__{impairment: %Impairment{blackout?: true}} = link, _packet, _size, _now),
+  @spec offer(t(), packet(), non_neg_integer()) :: {outcome(), t()}
+  def offer(%__MODULE__{impairment: %Impairment{blackout?: true}} = link, _packet, _size),
     do: {:blackout, link}
 
-  def offer(link, packet, size, _now) do
+  def offer(link, packet, size) do
     {lost?, link} = lost?(link)
 
     cond do
@@ -79,38 +80,62 @@ defmodule ChaosProxy.Link do
   end
 
   @doc """
-  Releases the packets the bucket can pay for, oldest first, and says in how
-  many milliseconds the next one can go (`nil` when the queue is empty).
+  Returns the packets that may leave at `now`, oldest first, and in how many
+  milliseconds to call again (`nil` when the link holds nothing).
   """
   @spec drain(t(), number()) :: {[packet()], t(), pos_integer() | nil}
-  def drain(link, now), do: release(refill(link, now), [])
+  def drain(link, now) do
+    {link, bucket_wait_ms} = link |> refill(now) |> release(now)
+    {due, link, delay_wait_ms} = due(link, now, [])
+    {due, link, sooner(bucket_wait_ms, delay_wait_ms)}
+  end
 
-  @doc "Bytes waiting in the queue."
+  @doc "Bytes waiting for the rate limit."
   @spec queue_bytes(t()) :: non_neg_integer()
   def queue_bytes(link), do: link.queue_bytes
 
-  @spec release(t(), [packet()]) :: {[packet()], t(), pos_integer() | nil}
-  defp release(link, released) do
+  @spec release(t(), number()) :: {t(), pos_integer() | nil}
+  defp release(link, now) do
     case :queue.peek(link.queue) do
       :empty ->
-        {Enum.reverse(released), link, nil}
+        {link, nil}
 
       {:value, {packet, size}} ->
         if affordable?(link, size) do
-          link = %{
-            link
-            | queue: :queue.drop(link.queue),
-              queue_bytes: link.queue_bytes - size,
-              tokens: spend(link, size)
-          }
-
-          release(link, [packet | released])
+          release(
+            %{
+              link
+              | queue: :queue.drop(link.queue),
+                queue_bytes: link.queue_bytes - size,
+                tokens: spend(link, size),
+                delayed: :queue.in({now + link.impairment.delay_ms, packet}, link.delayed)
+            },
+            now
+          )
         else
-          wait_ms = ceil((size - link.tokens) / bytes_per_ms(link.impairment))
-          {Enum.reverse(released), link, max(wait_ms, 1)}
+          {link, max(ceil((size - link.tokens) / bytes_per_ms(link.impairment)), 1)}
         end
     end
   end
+
+  @spec due(t(), number(), [packet()]) :: {[packet()], t(), pos_integer() | nil}
+  defp due(link, now, due) do
+    case :queue.peek(link.delayed) do
+      {:value, {at, packet}} when at <= now ->
+        due(%{link | delayed: :queue.drop(link.delayed)}, now, [packet | due])
+
+      {:value, {at, _packet}} ->
+        {Enum.reverse(due), link, ceil(at - now)}
+
+      :empty ->
+        {Enum.reverse(due), link, nil}
+    end
+  end
+
+  @spec sooner(pos_integer() | nil, pos_integer() | nil) :: pos_integer() | nil
+  defp sooner(nil, wait_ms), do: wait_ms
+  defp sooner(wait_ms, nil), do: wait_ms
+  defp sooner(one, other), do: min(one, other)
 
   @spec affordable?(t(), non_neg_integer()) :: boolean()
   defp affordable?(%{impairment: %Impairment{rate_kbps: :infinity}}, _size), do: true

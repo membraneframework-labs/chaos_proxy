@@ -5,65 +5,199 @@ defmodule ChaosProxy.LinkTest do
 
   @packet 1_500
 
-  # Offers `n` full-size packets at `now` and returns the outcomes.
-  defp burst(link, n, now) do
-    Enum.map_reduce(1..n, link, fn i, link -> Link.offer(link, i, @packet, now) end)
+  # Offers `n` full-size packets, numbered from `first`, and returns the outcomes.
+  defp burst(link, n, first \\ 1) do
+    Enum.map_reduce(first..(first + n - 1), link, &Link.offer(&2, &1, @packet))
   end
 
-  test "a transparent link releases everything at once" do
-    link = Link.new(%Impairment{}, 0, 0)
-    {outcomes, link} = burst(link, 100, 0)
-    assert Enum.all?(outcomes, &(&1 == :queued))
-    assert {released, _link, nil} = Link.drain(link, 0)
-    assert released == Enum.to_list(1..100)
-  end
+  describe "a transparent link" do
+    test "lets go of everything at once, in order" do
+      link = Link.new(%Impairment{}, 0, 0)
+      {outcomes, link} = burst(link, 100)
 
-  test "the bucket paces at the rate and says when to come back" do
-    # 120 kbit/s = 15 bytes/ms: a 1500-byte packet every 100 ms, after a
-    # burst allowance of 3 packets once the bucket has filled.
-    link = Link.new(%Impairment{rate_kbps: 120, queue_ms: 10_000}, 0, 0)
-    {_outcomes, link} = burst(link, 5, 0)
-
-    assert {[], link, 100} = Link.drain(link, 0)
-    assert {[1], link, 100} = Link.drain(link, 100)
-    assert {[2], link, 50} = Link.drain(link, 250)
-    assert {[3, 4, 5], link, nil} = Link.drain(link, 1_000)
-    assert Link.queue_bytes(link) == 0
-  end
-
-  test "the queue tail-drops beyond queue_ms, never below 8 packets" do
-    # 120 kbit/s for 100 ms is 1500 bytes: the floor of 8 packets applies.
-    link = Link.new(%Impairment{rate_kbps: 120, queue_ms: 100}, 0, 0)
-    {outcomes, link} = burst(link, 10, 0)
-    assert Enum.frequencies(outcomes) == %{queued: 8, dropped: 2}
-    assert Link.queue_bytes(link) == 8 * @packet
-  end
-
-  test "loss is seeded" do
-    losses = fn seed ->
-      link = Link.new(%Impairment{loss_pct: 30}, seed, 0)
-      {outcomes, _link} = burst(link, 200, 0)
-      Enum.count(outcomes, &(&1 == :lost))
+      assert Enum.all?(outcomes, &(&1 == :queued))
+      assert {released, link, nil} = Link.drain(link, 0)
+      assert released == Enum.to_list(1..100)
+      assert Link.queue_bytes(link) == 0
     end
 
-    assert losses.(7) == losses.(7)
-    assert losses.(7) != losses.(8)
-    assert losses.(7) in 30..90
+    test "holds nothing to come back for" do
+      assert {[], _link, nil} = Link.drain(Link.new(%Impairment{}, 0, 0), 50)
+    end
   end
 
-  test "a blackout refuses packets but lets the queue drain" do
-    link = Link.new(%Impairment{rate_kbps: 120, queue_ms: 10_000}, 0, 0)
-    {_outcomes, link} = burst(link, 2, 0)
-    link = Link.apply(link, %Impairment{rate_kbps: 120, queue_ms: 10_000, blackout?: true}, 0)
+  describe "the bucket" do
+    test "paces at the rate and says when to come back" do
+      # 120 kbit/s = 15 bytes/ms: a 1500-byte packet every 100 ms, after a
+      # burst allowance of 3 packets once the bucket has filled.
+      link = Link.new(%Impairment{rate_kbps: 120, queue_ms: 10_000}, 0, 0)
+      {_outcomes, link} = burst(link, 5)
 
-    assert {:blackout, link} = Link.offer(link, :late, @packet, 0)
-    assert {[1, 2], _link, nil} = Link.drain(link, 1_000)
+      assert {[], link, 100} = Link.drain(link, 0)
+      assert {[1], link, 100} = Link.drain(link, 100)
+      assert {[2], link, 50} = Link.drain(link, 250)
+      assert {[3, 4, 5], link, nil} = Link.drain(link, 1_000)
+      assert Link.queue_bytes(link) == 0
+    end
+
+    test "never holds less than three packets, whatever the rate" do
+      # 8 kbit/s is 20 bytes in 20 ms; the floor of 3 packets applies.
+      link = Link.new(%Impairment{rate_kbps: 8, queue_ms: 100_000}, 0, 0)
+      {_outcomes, link} = burst(link, 4)
+
+      assert {[1, 2, 3], _link, 1_500} = Link.drain(link, 1_000_000)
+    end
+
+    test "is drained at the new rate once the rate changes" do
+      link = Link.new(%Impairment{rate_kbps: 120, queue_ms: 10_000}, 0, 0)
+      {_outcomes, link} = burst(link, 3)
+      assert {[], link, 100} = Link.drain(link, 0)
+
+      link = Link.apply(link, %Impairment{rate_kbps: 1_200, queue_ms: 10_000}, 0)
+      assert {[], link, 10} = Link.drain(link, 0)
+
+      link = Link.apply(link, %Impairment{}, 5)
+      assert {[1, 2, 3], _link, nil} = Link.drain(link, 5)
+    end
+
+    test "keeps no more than the new burst when the rate drops" do
+      # 2400 kbit/s holds 6000 bytes, 120 kbit/s the floor of 4500.
+      link = Link.new(%Impairment{rate_kbps: 2_400, queue_ms: 10_000}, 0, 0)
+      link = Link.apply(link, %Impairment{rate_kbps: 120, queue_ms: 10_000}, 1_000)
+      {_outcomes, link} = burst(link, 4)
+
+      assert {[1, 2, 3], _link, 100} = Link.drain(link, 1_000)
+    end
   end
 
-  test "a new rate applies to what is already queued" do
-    link = Link.new(%Impairment{rate_kbps: 120, queue_ms: 10_000}, 0, 0)
-    {_outcomes, link} = burst(link, 3, 0)
-    link = Link.apply(link, %Impairment{}, 10)
-    assert {[1, 2, 3], _link, nil} = Link.drain(link, 10)
+  describe "the queue" do
+    test "tail-drops beyond queue_ms" do
+      # 1200 kbit/s for 200 ms is 30 000 bytes: 20 packets.
+      link = Link.new(%Impairment{rate_kbps: 1_200, queue_ms: 200}, 0, 0)
+      {outcomes, link} = burst(link, 25)
+
+      assert Enum.frequencies(outcomes) == %{queued: 20, dropped: 5}
+      assert List.last(outcomes) == :dropped
+      assert Link.queue_bytes(link) == 20 * @packet
+    end
+
+    test "never holds less than eight packets" do
+      # 120 kbit/s for 100 ms is 1500 bytes: the floor of 8 packets applies.
+      link = Link.new(%Impairment{rate_kbps: 120, queue_ms: 100}, 0, 0)
+      {outcomes, link} = burst(link, 10)
+
+      assert Enum.frequencies(outcomes) == %{queued: 8, dropped: 2}
+      assert Link.queue_bytes(link) == 8 * @packet
+    end
+
+    test "takes packets again once it has drained" do
+      link = Link.new(%Impairment{rate_kbps: 120, queue_ms: 100}, 0, 0)
+      {_outcomes, link} = burst(link, 8)
+      assert {:dropped, link} = Link.offer(link, 9, @packet)
+
+      assert {[1, 2, 3], link, _wait_ms} = Link.drain(link, 1_000)
+      assert {:queued, link} = Link.offer(link, 10, @packet)
+      assert Link.queue_bytes(link) == 6 * @packet
+    end
+  end
+
+  describe "loss" do
+    test "repeats for a seed and differs between seeds" do
+      outcomes = fn seed ->
+        link = Link.new(%Impairment{loss_pct: 30}, seed, 0)
+        link |> burst(200) |> elem(0)
+      end
+
+      assert outcomes.(7) == outcomes.(7)
+      assert outcomes.(7) != outcomes.(8)
+      assert Enum.sort(Enum.uniq(outcomes.(7))) == [:lost, :queued]
+    end
+
+    test "takes nothing at 0 and everything at 100 percent" do
+      none = Link.new(%Impairment{loss_pct: 0}, 1, 0)
+      all = Link.new(%Impairment{loss_pct: 100}, 1, 0)
+
+      assert {outcomes, _link} = burst(none, 100)
+      assert Enum.uniq(outcomes) == [:queued]
+      assert {outcomes, _link} = burst(all, 100)
+      assert Enum.uniq(outcomes) == [:lost]
+    end
+
+    test "does not queue what it took" do
+      {_outcomes, link} = burst(Link.new(%Impairment{loss_pct: 100}, 1, 0), 10)
+
+      assert Link.queue_bytes(link) == 0
+      assert {[], _link, nil} = Link.drain(link, 0)
+    end
+  end
+
+  describe "a blackout" do
+    test "refuses packets but lets the queue drain" do
+      shaped = %Impairment{rate_kbps: 120, queue_ms: 10_000}
+      {_outcomes, link} = burst(Link.new(shaped, 0, 0), 2)
+      link = Link.apply(link, %{shaped | blackout?: true}, 0)
+
+      assert {:blackout, link} = Link.offer(link, :late, @packet)
+      assert {[1, 2], _link, nil} = Link.drain(link, 1_000)
+    end
+
+    test "takes packets again once lifted" do
+      link = Link.new(%Impairment{blackout?: true}, 0, 0)
+      assert {:blackout, link} = Link.offer(link, 1, @packet)
+
+      link = Link.apply(link, %Impairment{}, 10)
+      assert {:queued, link} = Link.offer(link, 2, @packet)
+      assert {[2], _link, nil} = Link.drain(link, 10)
+    end
+  end
+
+  describe "the delay" do
+    test "holds packets for delay_ms and says when they are due" do
+      link = Link.new(%Impairment{delay_ms: 30}, 0, 0)
+      {_outcomes, link} = burst(link, 2)
+
+      assert {[], link, 30} = Link.drain(link, 0)
+      assert {[], link, 1} = Link.drain(link, 29)
+      assert {[1, 2], _link, nil} = Link.drain(link, 30)
+    end
+
+    test "counts from when the bucket lets a packet go" do
+      # The bucket has filled by 1000; the fourth packet waits for it 100 ms.
+      link = Link.new(%Impairment{rate_kbps: 120, queue_ms: 10_000, delay_ms: 30}, 0, 0)
+      {_outcomes, link} = burst(link, 4)
+
+      assert {[], link, 30} = Link.drain(link, 1_000)
+      assert {[1, 2, 3], link, 70} = Link.drain(link, 1_030)
+      assert {[], link, 30} = Link.drain(link, 1_100)
+      assert {[4], _link, nil} = Link.drain(link, 1_130)
+    end
+
+    test "comes back for whichever is sooner, the bucket or the delay" do
+      link = Link.new(%Impairment{rate_kbps: 120, queue_ms: 10_000, delay_ms: 500}, 0, 0)
+      {_outcomes, link} = burst(link, 4)
+
+      assert {[], _link, 100} = Link.drain(link, 1_000)
+    end
+
+    test "a shorter one does not overtake packets held for a longer one" do
+      link = Link.new(%Impairment{delay_ms: 100}, 0, 0)
+      {:queued, link} = Link.offer(link, 1, @packet)
+      assert {[], link, 100} = Link.drain(link, 0)
+
+      link = Link.apply(link, %Impairment{delay_ms: 10}, 5)
+      {:queued, link} = Link.offer(link, 2, @packet)
+
+      assert {[], link, 95} = Link.drain(link, 5)
+      assert {[], link, 50} = Link.drain(link, 50)
+      assert {[1, 2], _link, nil} = Link.drain(link, 100)
+    end
+
+    test "is not counted as queued" do
+      link = Link.new(%Impairment{delay_ms: 30}, 0, 0)
+      {_outcomes, link} = burst(link, 2)
+      {[], link, 30} = Link.drain(link, 0)
+
+      assert Link.queue_bytes(link) == 0
+    end
   end
 end

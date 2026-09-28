@@ -130,6 +130,38 @@ defmodule ChaosProxyTest do
     assert_receive {:udp, ^socket, _, ^port, "again"}, 1_000
   end
 
+  test "refuses clients beyond max_clients until one goes idle" do
+    {proxy, port} = start(max_clients: 1, client_idle_ms: 200)
+    first = client()
+    second = client()
+
+    :ok = :gen_udp.send(first, {127, 0, 0, 1}, port, "first")
+    assert_receive {:udp, ^first, _, ^port, "first"}, 1_000
+
+    :ok = :gen_udp.send(second, {127, 0, 0, 1}, port, "refused")
+    refute_receive {:udp, ^second, _, _, _}, 100
+    assert %{clients: 1, totals: %{up: %{refused_packets: 1}}} = ChaosProxy.report(proxy)
+
+    # Once the first one is idle, it gives way.
+    Process.sleep(250)
+    :ok = :gen_udp.send(second, {127, 0, 0, 1}, port, "second")
+    assert_receive {:udp, ^second, _, ^port, "second"}, 1_000
+  end
+
+  test "a delayed link delivers in order" do
+    {_proxy, port} = start(impairment: %Impairment{delay_ms: 20})
+    socket = client()
+    for i <- 1..2_000, do: :gen_udp.send(socket, {127, 0, 0, 1}, port, <<i::16>>)
+
+    received =
+      for _i <- 1..2_000 do
+        assert_receive {:udp, ^socket, _ip, ^port, <<i::16>>}, 1_000
+        i
+      end
+
+    assert received == Enum.to_list(1..2_000)
+  end
+
   test "history bounds the per-second buckets but not the totals" do
     {proxy, port} = start(history: 2)
     socket = client()

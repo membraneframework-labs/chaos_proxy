@@ -58,7 +58,8 @@ proxy per client.
 
 `report/1` has counters per direction for every second (the last `:history`
 of them, 300 by default) and in total: offered and forwarded bytes, tail-drop,
-loss and blackout packet counts, and the peak queue.
+loss, blackout and refused (over `:max_clients`) packet counts, and the peak
+queue.
 
 `ChaosProxy.Link` is the shaper on its own, as plain data with the time passed
 in, for driving it from a simulation or a test without sockets.
@@ -68,7 +69,7 @@ The options are documented in `ChaosProxy`.
 ## Fidelity
 
 - Timing has millisecond granularity: delays and bucket pacing are
-  `Process.send_after/3` timers.
+  `Process.send_after/3` timers. Each direction keeps its packets in order.
 - The bucket holds at least three and the queue at least eight 1500-byte
   packets, whatever the rate, so full-size datagrams still pass a very slow
   link.

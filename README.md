@@ -4,8 +4,8 @@
 [![API Docs](https://img.shields.io/badge/api-docs-yellow.svg?style=flat)](https://hexdocs.pm/chaos_proxy)
 
 A seeded UDP forwarder that sits between clients and one upstream and behaves
-like a bad link, each direction on its own: blackout, random loss, a rate
-limit with a queue, and delay. It knows nothing about what it carries; QUIC is
+like a bad link, each direction on its own: blackout, loss at random or in
+bursts, a rate limit with a queue, and delay with jitter. It knows nothing about what it carries; QUIC is
 encrypted and addressed by connection ID, so forwarding datagrams is
 transparent to it. It was written to put congestion between MoQ relays,
 publishers and subscribers.
@@ -51,8 +51,10 @@ a simulation or a test.
 
 - Timing has millisecond granularity, and each direction keeps its packets in
   order.
-- There is no jitter, reordering, duplication or corruption.
-- Losses repeat for a seed; packet timing does not, so a repeated run is
+- Jitter does not reorder packets: one that drew a shorter delay leaves with
+  the one before it.
+- There is no reordering, duplication or corruption.
+- Losses and drawn delays repeat for a seed; packet timing does not, so a repeated run is
   close, not identical.
 - On an Apple M3 Pro, one client sending 1200-byte datagrams got 1.6 Gbit/s
   through a transparent proxy and 800 Mbit/s through a rate-limited one with

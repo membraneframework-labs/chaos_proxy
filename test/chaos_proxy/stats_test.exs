@@ -23,6 +23,7 @@ defmodule ChaosProxy.StatsTest do
              :blackout_packets,
              :dropped_packets,
              :forwarded_bytes,
+             :forwarded_packets,
              :lost_packets,
              :offered_bytes,
              :queue_bytes_max,

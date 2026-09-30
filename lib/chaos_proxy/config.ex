@@ -17,7 +17,7 @@ defmodule ChaosProxy.Config do
       `ChaosProxy.port/1`
     * `:impairment` - the initial one, in any form `ChaosProxy.apply/2` takes;
       default transparent
-    * `:seed` - makes the random loss repeatable, default 0
+    * `:seed` - makes the loss and the jitter repeatable, default 0
     * `:history` - how many seconds `ChaosProxy.report/1` goes back, default
       300; `:infinity` keeps them all
     * `:client_idle_ms` - a client silent this long in both directions is

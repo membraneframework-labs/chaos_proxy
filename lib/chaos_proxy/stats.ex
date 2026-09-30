@@ -15,6 +15,7 @@ defmodule ChaosProxy.Stats do
   @type sum ::
           :offered_bytes
           | :forwarded_bytes
+          | :forwarded_packets
           | :dropped_packets
           | :lost_packets
           | :blackout_packets
@@ -82,6 +83,7 @@ defmodule ChaosProxy.Stats do
     do: %{
       offered_bytes: 0,
       forwarded_bytes: 0,
+      forwarded_packets: 0,
       dropped_packets: 0,
       lost_packets: 0,
       blackout_packets: 0,

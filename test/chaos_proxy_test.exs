@@ -71,9 +71,9 @@ defmodule ChaosProxyTest do
            } = ChaosProxy.report(proxy)
 
     assert up == down
-    assert %{offered_bytes: 5, forwarded_bytes: 5} = up
+    assert %{offered_bytes: 5, forwarded_bytes: 5, forwarded_packets: 1} = up
 
-    assert Map.drop(up, [:offered_bytes, :forwarded_bytes]) == %{
+    assert Map.drop(up, [:offered_bytes, :forwarded_bytes, :forwarded_packets]) == %{
              dropped_packets: 0,
              lost_packets: 0,
              blackout_packets: 0,

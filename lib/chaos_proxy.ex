@@ -44,9 +44,9 @@ defmodule ChaosProxy do
   What one direction did with its packets:
 
     * `offered_bytes` - arrived at the proxy
-    * `forwarded_bytes` - left it, after their delay
+    * `forwarded_bytes`, `forwarded_packets` - left it, after their delay
     * `dropped_packets` - did not fit the queue
-    * `lost_packets` - taken by random loss
+    * `lost_packets` - taken by loss, random or in bursts
     * `blackout_packets` - arrived during a blackout
     * `queue_bytes_max` - the most that waited for the rate limit at once
     * `refused_packets` - came from a client the proxy did not take, being at
@@ -55,6 +55,7 @@ defmodule ChaosProxy do
   @type counters :: %{
           offered_bytes: non_neg_integer(),
           forwarded_bytes: non_neg_integer(),
+          forwarded_packets: non_neg_integer(),
           dropped_packets: non_neg_integer(),
           lost_packets: non_neg_integer(),
           blackout_packets: non_neg_integer(),
@@ -125,10 +126,11 @@ defmodule ChaosProxy do
 
   A keyword list with `:up` and/or `:down` sets those directions and leaves
   the other as it is. A bare `Impairment` sets the downlink and gives the
-  uplink only its `delay_ms` and `blackout?`: a bottleneck in front of the
-  clients, with the delay of the path back.
+  uplink only its `delay_ms`, `jitter_ms` and `blackout?`: a bottleneck in
+  front of the clients, with the delay of the path back.
 
-  Raises `ArgumentError` for a `rate_kbps` that is not above 0.
+  Raises `ArgumentError` for a `rate_kbps` that is not above 0 and for a
+  `loss_burst` below 1.
   """
   @spec apply(GenServer.server(), impairments()) :: :ok
   def apply(proxy, impairments),
@@ -271,6 +273,7 @@ defmodule ChaosProxy do
     state.links[direction]
     |> put_in(link)
     |> add(direction, :forwarded_bytes, forwarded)
+    |> add(direction, :forwarded_packets, length(due))
     |> schedule(direction, wait_ms, now)
   end
 

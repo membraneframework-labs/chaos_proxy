@@ -19,13 +19,15 @@ defmodule ChaosProxy.Link do
   @type packet :: term()
   @typedoc """
   What became of an offered packet: it is held (`:queued`), or gone to a
-  blackout, to random loss or for want of room in the queue (`:dropped`).
+  blackout, to loss or for want of room in the queue (`:dropped`).
   """
   @type outcome :: :blackout | :lost | :dropped | :queued
 
   @type t :: %__MODULE__{
           impairment: Impairment.t(),
           rng: :rand.state(),
+          jitter_rng: :rand.state(),
+          bad?: boolean(),
           queue: :queue.queue({packet(), non_neg_integer()}),
           queue_bytes: non_neg_integer(),
           tokens: number(),
@@ -33,15 +35,17 @@ defmodule ChaosProxy.Link do
           delayed: :queue.queue({due :: number(), packet()})
         }
 
-  @enforce_keys [:impairment, :rng, :queue, :delayed, :refilled_at]
-  defstruct @enforce_keys ++ [queue_bytes: 0, tokens: 0.0]
+  @enforce_keys [:impairment, :rng, :jitter_rng, :queue, :delayed, :refilled_at]
+  defstruct @enforce_keys ++ [queue_bytes: 0, tokens: 0.0, bad?: false]
 
-  @doc "A link holding nothing. `seed` makes its losses repeatable."
+  @doc "A link holding nothing. `seed` makes its losses and its jitter repeatable."
   @spec new(Impairment.t(), integer(), number()) :: t()
   def new(%Impairment{} = impairment, seed, now) do
     %__MODULE__{
       impairment: impairment,
       rng: :rand.seed_s(:exsss, {seed, seed + 1, seed + 2}),
+      # Of its own, so that the jitter does not change what is lost.
+      jitter_rng: :rand.seed_s(:exsss, {seed + 3, seed + 4, seed + 5}),
       queue: :queue.new(),
       delayed: :queue.new(),
       refilled_at: now
@@ -102,13 +106,15 @@ defmodule ChaosProxy.Link do
 
       {:value, {packet, size}} ->
         if affordable?(link, size) do
+          {delay_ms, link} = delay_ms(link)
+
           release(
             %{
               link
               | queue: :queue.drop(link.queue),
                 queue_bytes: link.queue_bytes - size,
                 tokens: spend(link, size),
-                delayed: :queue.in({now + link.impairment.delay_ms, packet}, link.delayed)
+                delayed: :queue.in({now + delay_ms, packet}, link.delayed)
             },
             now
           )
@@ -118,6 +124,17 @@ defmodule ChaosProxy.Link do
     end
   end
 
+  @spec delay_ms(t()) :: {number(), t()}
+  defp delay_ms(%{impairment: %Impairment{jitter_ms: 0, delay_ms: delay_ms}} = link),
+    do: {delay_ms, link}
+
+  defp delay_ms(%{impairment: %Impairment{jitter_ms: jitter_ms, delay_ms: delay_ms}} = link) do
+    {delay_ms, rng} = :rand.normal_s(delay_ms, jitter_ms * jitter_ms, link.jitter_rng)
+    {max(delay_ms, 0), %{link | jitter_rng: rng}}
+  end
+
+  # The packets leave in the order they were delayed in, so one due before
+  # the packet ahead of it waits for that one.
   @spec due(t(), number(), [packet()]) :: {[packet()], t(), pos_integer() | nil}
   defp due(link, now, due) do
     case :queue.peek(link.delayed) do
@@ -148,9 +165,17 @@ defmodule ChaosProxy.Link do
   @spec lost?(t()) :: {boolean(), t()}
   defp lost?(%{impairment: %Impairment{loss_pct: pct}} = link) when pct <= 0, do: {false, link}
 
-  defp lost?(%{impairment: %Impairment{loss_pct: pct}} = link) do
+  defp lost?(%{impairment: %Impairment{loss_pct: pct, loss_burst: burst}} = link)
+       when burst == 1 or pct >= 100 do
     {x, rng} = :rand.uniform_s(link.rng)
     {x * 100 < pct, %{link | rng: rng}}
+  end
+
+  defp lost?(link) do
+    {p, r} = Impairment.gilbert(link.impairment)
+    {x, rng} = :rand.uniform_s(link.rng)
+    turns? = if link.bad?, do: x < r, else: x < p
+    {link.bad?, %{link | rng: rng, bad?: link.bad? != turns?}}
   end
 
   @spec refill(t(), number()) :: t()

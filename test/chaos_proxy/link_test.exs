@@ -1,5 +1,6 @@
 defmodule ChaosProxy.LinkTest do
   use ExUnit.Case, async: true
+  use ExUnitProperties
 
   alias ChaosProxy.{Impairment, Link}
 
@@ -23,6 +24,56 @@ defmodule ChaosProxy.LinkTest do
   defp deviation(values) do
     mean = mean(values)
     :math.sqrt(mean(Enum.map(values, &((&1 - mean) ** 2))))
+  end
+
+  # Offers a packet at each of the times and drains at each. Returns the
+  # outcomes, and each packet that left with when it did.
+  defp offer_at(link, times) do
+    {outcomes, {_link, left}} =
+      times
+      |> Enum.with_index()
+      |> Enum.map_reduce({link, []}, fn {at, packet}, {link, left} ->
+        {outcome, link} = Link.offer(link, packet, @packet)
+        {due, link, _wait_ms} = Link.drain(link, at)
+        {outcome, {link, left ++ Enum.map(due, &{&1, at})}}
+      end)
+
+    {outcomes, left}
+  end
+
+  defp impairment do
+    gen all loss_pct <- integer(0..100),
+            loss_burst <- one_of([constant(1), float(min: 1.0, max: 20.0)]),
+            rate_kbps <- one_of([constant(:infinity), integer(100..10_000)]),
+            queue_ms <- integer(1..500),
+            delay_ms <- integer(0..100) do
+      %Impairment{
+        loss_pct: loss_pct,
+        loss_burst: loss_burst,
+        rate_kbps: rate_kbps,
+        queue_ms: queue_ms,
+        delay_ms: delay_ms
+      }
+    end
+  end
+
+  # Times in milliseconds, in order.
+  defp times,
+    do: map(list_of(integer(0..20), max_length: 200), &Enum.scan(&1, fn gap, at -> at + gap end))
+
+  test "repeats its losses and its delays for a seed, and not for another" do
+    times = Enum.map(0..199, &(&1 * 10))
+
+    for impairment <- [
+          %Impairment{loss_pct: 30},
+          %Impairment{loss_pct: 30, loss_burst: 3},
+          %Impairment{delay_ms: 50, jitter_ms: 10}
+        ] do
+      run = &offer_at(Link.new(impairment, &1, 0), times)
+
+      assert run.(7) == run.(7)
+      assert run.(7) != run.(8)
+    end
   end
 
   # Offers a packet at each of the times and drains whenever the link says
@@ -74,12 +125,15 @@ defmodule ChaosProxy.LinkTest do
       assert Link.queue_bytes(link) == 0
     end
 
-    test "never holds less than three packets, whatever the rate" do
-      # 8 kbit/s is 20 bytes in 20 ms; the floor of 3 packets applies.
-      link = Link.new(%Impairment{rate_kbps: 8, queue_ms: 100_000}, 0, 0)
-      {_outcomes, link} = burst(link, 4)
+    property "lets 20 ms at the rate through at once, and never less than three packets" do
+      check all rate_kbps <- integer(1..20_000) do
+        link = Link.new(%Impairment{rate_kbps: rate_kbps, queue_ms: 10_000_000}, 0, 0)
+        {_outcomes, link} = burst(link, 20)
+        {released, _link, _wait_ms} = Link.drain(link, 1_000_000)
+        allowance = max(3 * @packet, rate_kbps / 8 * 20)
 
-      assert {[1, 2, 3], _link, 1_500} = Link.drain(link, 1_000_000)
+        assert length(released) == min(20, trunc(allowance / @packet))
+      end
     end
 
     test "is drained at the new rate once the rate changes" do
@@ -105,23 +159,18 @@ defmodule ChaosProxy.LinkTest do
   end
 
   describe "the queue" do
-    test "tail-drops beyond queue_ms" do
-      # 1200 kbit/s for 200 ms is 30 000 bytes: 20 packets.
-      link = Link.new(%Impairment{rate_kbps: 1_200, queue_ms: 200}, 0, 0)
-      {outcomes, link} = burst(link, 25)
+    property "holds queue_ms at the rate, never less than eight packets, and drops the rest" do
+      check all rate_kbps <- integer(1..2_000), queue_ms <- integer(1..500), n <- integer(1..120) do
+        link = Link.new(%Impairment{rate_kbps: rate_kbps, queue_ms: queue_ms}, 0, 0)
+        {outcomes, link} = burst(link, n)
+        queued = Enum.count(outcomes, &(&1 == :queued))
+        room = round(max(8 * @packet, rate_kbps / 8 * queue_ms))
 
-      assert Enum.frequencies(outcomes) == %{queued: 20, dropped: 5}
-      assert List.last(outcomes) == :dropped
-      assert Link.queue_bytes(link) == 20 * @packet
-    end
-
-    test "never holds less than eight packets" do
-      # 120 kbit/s for 100 ms is 1500 bytes: the floor of 8 packets applies.
-      link = Link.new(%Impairment{rate_kbps: 120, queue_ms: 100}, 0, 0)
-      {outcomes, link} = burst(link, 10)
-
-      assert Enum.frequencies(outcomes) == %{queued: 8, dropped: 2}
-      assert Link.queue_bytes(link) == 8 * @packet
+        assert outcomes == List.duplicate(:queued, queued) ++ List.duplicate(:dropped, n - queued)
+        assert Link.queue_bytes(link) == queued * @packet
+        assert queued * @packet <= room
+        assert queued == n or (queued + 1) * @packet > room
+      end
     end
 
     test "takes packets again once it has drained" do
@@ -136,17 +185,6 @@ defmodule ChaosProxy.LinkTest do
   end
 
   describe "loss" do
-    test "repeats for a seed and differs between seeds" do
-      outcomes = fn seed ->
-        link = Link.new(%Impairment{loss_pct: 30}, seed, 0)
-        link |> burst(200) |> elem(0)
-      end
-
-      assert outcomes.(7) == outcomes.(7)
-      assert outcomes.(7) != outcomes.(8)
-      assert Enum.sort(Enum.uniq(outcomes.(7))) == [:lost, :queued]
-    end
-
     test "takes nothing at 0 and everything at 100 percent, queueing none of it" do
       {outcomes, _link} = burst(Link.new(%Impairment{loss_pct: 0}, 1, 0), 100)
       assert Enum.uniq(outcomes) == [:queued]
@@ -190,16 +228,6 @@ defmodule ChaosProxy.LinkTest do
       assert_in_delta 100 * Enum.sum(runs) / length(outcomes), 5, 0.25
       # Two in a row happen by chance: 1 / (1 - 0.05).
       assert_in_delta mean(runs), 1.053, 0.01
-    end
-
-    test "repeats for a seed and differs between seeds" do
-      outcomes = fn seed ->
-        link = Link.new(%Impairment{loss_pct: 30, loss_burst: 3}, seed, 0)
-        link |> burst(200) |> elem(0)
-      end
-
-      assert outcomes.(7) == outcomes.(7)
-      assert outcomes.(7) != outcomes.(8)
     end
 
     test "goes on through a change of the impairment" do
@@ -313,16 +341,6 @@ defmodule ChaosProxy.LinkTest do
       assert mean(Enum.map(left, &elem(&1, 1))) > 45
     end
 
-    test "repeats for a seed and differs between seeds" do
-      held = fn seed ->
-        link = Link.new(%Impairment{delay_ms: 50, jitter_ms: 10}, seed, 0)
-        held(link, Enum.map(0..99, &(&1 * @apart)))
-      end
-
-      assert held.(7) == held.(7)
-      assert held.(7) != held.(8)
-    end
-
     test "is not what another link loses by" do
       # The proxy's two directions are links with neighbouring seeds.
       streams =
@@ -334,21 +352,16 @@ defmodule ChaosProxy.LinkTest do
       assert length(Enum.uniq(streams)) == length(streams)
     end
 
-    test "does not change what is lost" do
-      lossy = %Impairment{loss_pct: 30, loss_burst: 3, delay_ms: 50}
+    property "does not change what is lost or dropped" do
+      check all impairment <- impairment(),
+                jitter_ms <- integer(1..50),
+                seed <- integer(),
+                times <- times() do
+        {outcomes, _left} = offer_at(Link.new(impairment, seed, 0), times)
+        jittered = %{impairment | jitter_ms: jitter_ms}
 
-      outcomes = fn impairment ->
-        {outcomes, _link} =
-          Enum.map_reduce(1..500, Link.new(impairment, 7, 0), fn packet, link ->
-            {outcome, link} = Link.offer(link, packet, @packet)
-            {_left, link, _wait_ms} = Link.drain(link, packet * 10)
-            {outcome, link}
-          end)
-
-        outcomes
+        assert {^outcomes, _left} = offer_at(Link.new(jittered, seed, 0), times)
       end
-
-      assert outcomes.(lossy) == outcomes.(%{lossy | jitter_ms: 20})
     end
   end
 end

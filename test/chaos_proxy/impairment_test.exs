@@ -1,26 +1,20 @@
 defmodule ChaosProxy.ImpairmentTest do
   use ExUnit.Case, async: true
+  use ExUnitProperties
 
   alias ChaosProxy.Impairment
 
-  describe "gilbert/1" do
-    test "loses loss_pct of the packets in spells of loss_burst" do
-      for pct <- [1, 5, 20, 50], burst <- [2, 5, 20, 2.5] do
-        {p, r} = Impairment.gilbert(%Impairment{loss_pct: pct, loss_burst: burst})
+  property "gilbert/1 loses loss_pct in spells of loss_burst, or longer where those cannot" do
+    check all pct <- integer(1..99),
+              burst <- one_of([integer(1..50), float(min: 1.0, max: 50.0)]) do
+      {p, r} = Impairment.gilbert(%Impairment{loss_pct: pct, loss_burst: burst})
 
-        assert_in_delta 1 / r, burst, 1.0e-9
-        assert_in_delta 100 * p / (p + r), pct, 1.0e-9
-      end
-    end
+      assert p > 0 and p <= 1 and r > 0 and r <= 1
+      assert_in_delta 100 * p / (p + r), pct, 1.0e-9
 
-    test "has longer spells where loss_burst cannot lose loss_pct" do
-      for {pct, burst, spell} <- [{80, 2, 4.0}, {90, 3, 9.0}, {75, 3, 3.0}] do
-        {p, r} = Impairment.gilbert(%Impairment{loss_pct: pct, loss_burst: burst})
-
-        assert_in_delta p, 1.0, 1.0e-9
-        assert_in_delta 1 / r, spell, 1.0e-9
-        assert_in_delta 100 * p / (p + r), pct, 1.0e-9
-      end
+      if pct <= 100 * burst / (burst + 1),
+        do: assert_in_delta(1 / r, burst, 1.0e-9),
+        else: assert_in_delta(p, 1.0, 1.0e-9)
     end
   end
 

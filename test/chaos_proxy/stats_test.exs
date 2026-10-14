@@ -1,5 +1,6 @@
 defmodule ChaosProxy.StatsTest do
   use ExUnit.Case, async: true
+  use ExUnitProperties
 
   alias ChaosProxy.Stats
 
@@ -53,30 +54,21 @@ defmodule ChaosProxy.StatsTest do
     assert {:same, ^stats} = Stats.rotate(stats, 1)
   end
 
-  test "reports the seconds oldest first, without the ones nothing happened in" do
-    stats = Stats.new(300) |> forward(0, 1) |> forward(1, 2) |> forward(5, 3)
+  property "reports the last `history` seconds oldest first, and all of them in the totals" do
+    check all history <- one_of([integer(1..20), constant(:infinity)]),
+              gaps <- list_of(integer(1..5), max_length: 50) do
+      seconds = Enum.scan([0 | gaps], &+/2)
+      # A second's bytes tell it apart from the others.
+      stats = Enum.reduce(seconds, Stats.new(history), &forward(&2, &1, &1 + 1))
+      kept = if history == :infinity, do: seconds, else: Enum.take(seconds, -history)
 
-    assert %{seconds: seconds, totals: %{down: %{forwarded_bytes: 6}}} = Stats.report(stats)
-    assert Enum.map(seconds, &{&1.second, &1.down.forwarded_bytes}) == [{0, 1}, {1, 2}, {5, 3}]
-  end
+      assert %{seconds: reported, totals: %{down: %{forwarded_bytes: total}}} =
+               Stats.report(stats)
 
-  test "history bounds the seconds, the current one included, but not the totals" do
-    stats = Enum.reduce(0..9, Stats.new(3), &forward(&2, &1, 10))
+      assert Enum.map(reported, &{&1.second, &1.down.forwarded_bytes}) ==
+               Enum.map(kept, &{&1, &1 + 1})
 
-    assert %{seconds: seconds, totals: %{down: %{forwarded_bytes: 100}}} = Stats.report(stats)
-    assert Enum.map(seconds, & &1.second) == [7, 8, 9]
-  end
-
-  test "a history of one keeps the current second only" do
-    stats = Enum.reduce(0..3, Stats.new(1), &forward(&2, &1, 10))
-
-    assert %{seconds: [%{second: 3}]} = Stats.report(stats)
-  end
-
-  test "an infinite history keeps every second" do
-    stats = Enum.reduce(0..999, Stats.new(:infinity), &forward(&2, &1, 10))
-
-    assert %{seconds: seconds} = Stats.report(stats)
-    assert Enum.map(seconds, & &1.second) == Enum.to_list(0..999)
+      assert total == seconds |> Enum.map(&(&1 + 1)) |> Enum.sum()
+    end
   end
 end

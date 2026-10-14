@@ -54,10 +54,14 @@ defmodule ChaosProxy.StatsTest do
     assert {:same, ^stats} = Stats.rotate(stats, 1)
   end
 
+  # Seconds from 0 on, in order, some skipped.
+  defp seconds do
+    gaps = list_of(integer(1..5), max_length: 50)
+    map(gaps, fn gaps -> Enum.scan([0 | gaps], &+/2) end)
+  end
+
   property "reports the last `history` seconds oldest first, and all of them in the totals" do
-    check all history <- one_of([integer(1..20), constant(:infinity)]),
-              gaps <- list_of(integer(1..5), max_length: 50) do
-      seconds = Enum.scan([0 | gaps], &+/2)
+    check all history <- one_of([integer(1..20), constant(:infinity)]), seconds <- seconds() do
       # A second's bytes tell it apart from the others.
       stats = Enum.reduce(seconds, Stats.new(history), &forward(&2, &1, &1 + 1))
       kept = if history == :infinity, do: seconds, else: Enum.take(seconds, -history)

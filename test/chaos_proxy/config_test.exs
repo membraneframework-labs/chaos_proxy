@@ -14,11 +14,8 @@ defmodule ChaosProxy.ConfigTest do
              {10, 0, 0, 1}
   end
 
-  test "has an impairment for each direction, whichever form apply/2 takes was given" do
+  test "leaves a direction the impairment does not name transparent" do
     thin = %Impairment{rate_kbps: 500, delay_ms: 10}
-
-    assert Config.new!(upstream_port: 1, impairment: thin).impairment ==
-             %{down: thin, up: %Impairment{delay_ms: 10}}
 
     assert Config.new!(upstream_port: 1, impairment: [up: thin]).impairment ==
              %{up: thin, down: %Impairment{}}

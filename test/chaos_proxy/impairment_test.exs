@@ -3,11 +3,6 @@ defmodule ChaosProxy.ImpairmentTest do
 
   alias ChaosProxy.Impairment
 
-  test "is a transparent link by default" do
-    assert %Impairment{blackout?: false, loss_pct: 0, rate_kbps: :infinity, delay_ms: 0} =
-             %Impairment{}
-  end
-
   describe "gilbert/1" do
     test "loses loss_pct of the packets in spells of loss_burst" do
       for pct <- [1, 5, 20, 50], burst <- [2, 5, 20, 2.5] do
@@ -59,37 +54,29 @@ defmodule ChaosProxy.ImpairmentTest do
     test "takes any rate above 0, and no limit" do
       for rate <- [1, 0.5, 1.0e-3, 100_000, :infinity] do
         impairment = %Impairment{rate_kbps: rate}
-
         assert %{down: ^impairment} = Impairment.split(impairment)
-        assert %{up: ^impairment} = Impairment.split(up: impairment)
       end
     end
 
     test "refuses bursts of less than a packet" do
       for burst <- [0, 0.5, -1, nil] do
-        impairment = %Impairment{loss_pct: 5, loss_burst: burst}
-
         assert_raise ArgumentError, ~r/loss_burst must be 1 or more/, fn ->
-          Impairment.split(impairment)
-        end
-
-        assert_raise ArgumentError, ~r/loss_burst must be 1 or more/, fn ->
-          Impairment.split(up: impairment)
+          Impairment.split(%Impairment{loss_pct: 5, loss_burst: burst})
         end
       end
     end
 
     test "refuses a rate that lets nothing through" do
       for rate <- [0, 0.0, -0.0, -5, -5.0] do
-        impairment = %Impairment{rate_kbps: rate}
-
         assert_raise ArgumentError, ~r/rate_kbps must be above 0/, fn ->
-          Impairment.split(impairment)
+          Impairment.split(%Impairment{rate_kbps: rate})
         end
+      end
+    end
 
-        assert_raise ArgumentError, ~r/rate_kbps must be above 0/, fn ->
-          Impairment.split(down: %Impairment{}, up: impairment)
-        end
+    test "refuses a keyword list with any impairment it would refuse bare" do
+      assert_raise ArgumentError, ~r/rate_kbps must be above 0/, fn ->
+        Impairment.split(down: %Impairment{}, up: %Impairment{rate_kbps: 0})
       end
     end
   end

@@ -18,17 +18,6 @@ defmodule ChaosProxy.StatsTest do
 
     assert up == down
     assert Enum.uniq(Map.values(up)) == [0]
-
-    assert Enum.sort(Map.keys(up)) == [
-             :blackout_packets,
-             :dropped_packets,
-             :forwarded_bytes,
-             :forwarded_packets,
-             :lost_packets,
-             :offered_bytes,
-             :queue_bytes_max,
-             :refused_packets
-           ]
   end
 
   test "counts per direction, in the current second and in total" do

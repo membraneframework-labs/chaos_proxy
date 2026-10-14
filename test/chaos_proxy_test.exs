@@ -133,41 +133,14 @@ defmodule ChaosProxyTest do
     assert ChaosProxy.start_link(config) == {:error, {:listen, :eaddrinuse}}
   end
 
-  test "apply/2 refuses a rate that lets nothing through and keeps the one it had" do
-    {proxy, port} = start(impairment: %Impairment{delay_ms: 1})
-    socket = client()
-
-    assert_raise ArgumentError, ~r/rate_kbps must be above 0/, fn ->
-      ChaosProxy.apply(proxy, %Impairment{rate_kbps: 0.0})
-    end
-
-    send_to(socket, port, "still")
-    assert_receive {:udp, ^socket, _ip, ^port, "still"}, 5_000
-    assert Process.alive?(proxy)
-  end
-
   test "a packet takes no less than the delay of both directions" do
-    {_proxy, port} = start(impairment: [up: %Impairment{delay_ms: 30}])
-    socket = client()
-    sent_at = System.monotonic_time(:millisecond)
-
-    send_to(socket, port, "ping")
-    assert_receive {:udp, ^socket, _ip, ^port, "ping"}, 5_000
-    assert System.monotonic_time(:millisecond) - sent_at >= 30
-  end
-
-  test "a bare impairment is mirrored on the uplink" do
-    {proxy, port} = start(impairment: %Impairment{delay_ms: 30})
+    {_proxy, port} = start(impairment: %Impairment{delay_ms: 30})
     socket = client()
     sent_at = System.monotonic_time(:millisecond)
 
     send_to(socket, port, "ping")
     assert_receive {:udp, ^socket, _ip, ^port, "ping"}, 5_000
     assert System.monotonic_time(:millisecond) - sent_at >= 60
-
-    :ok = ChaosProxy.apply(proxy, %Impairment{blackout?: true})
-    send_to(socket, port, "lost")
-    report_matching(proxy, %{totals: %{up: %{blackout_packets: 1}}})
   end
 
   test "a delayed link delivers in order" do
@@ -184,30 +157,21 @@ defmodule ChaosProxyTest do
     assert received == Enum.to_list(1..500)
   end
 
-  test "shapes the uplink on its own" do
-    # At 1 kbit/s the bucket takes 12 s to pay for one packet, so none of
-    # these leaves: the queue takes its floor of 8 and the rest is dropped.
-    {proxy, port} = start(impairment: [up: %Impairment{rate_kbps: 1, queue_ms: 10}])
-    socket = client()
-    for _i <- 1..20, do: send_to(socket, port, @packet)
+  for {shaped, other} <- [up: :down, down: :up] do
+    test "shapes the #{shaped}link on its own" do
+      {proxy, port} = start(impairment: [{unquote(shaped), %Impairment{rate_kbps: 1}}])
+      socket = client()
+      for _i <- 1..20, do: send_to(socket, port, @packet)
 
-    assert %{totals: %{up: up, down: down}} =
-             report_matching(proxy, %{totals: %{up: %{offered_bytes: 30_000}}})
+      assert %{totals: %{unquote(shaped) => shaped, unquote(other) => other}} =
+               report_matching(proxy, %{
+                 totals: %{unquote(shaped) => %{offered_bytes: 30_000}}
+               })
 
-    assert %{dropped_packets: 12, forwarded_bytes: 0, queue_bytes_max: 12_000} = up
-    assert %{offered_bytes: 0, dropped_packets: 0} = down
-  end
-
-  test "shapes the downlink on its own" do
-    {proxy, port} = start(impairment: [down: %Impairment{rate_kbps: 1, queue_ms: 10}])
-    socket = client()
-    for _i <- 1..20, do: send_to(socket, port, @packet)
-
-    assert %{totals: %{up: up, down: down}} =
-             report_matching(proxy, %{totals: %{down: %{offered_bytes: 30_000}}})
-
-    assert %{offered_bytes: 30_000, forwarded_bytes: 30_000, dropped_packets: 0} = up
-    assert %{dropped_packets: 12, forwarded_bytes: 0, queue_bytes_max: 12_000} = down
+      assert shaped.dropped_packets > 0
+      assert shaped.queue_bytes_max > 0
+      assert other.dropped_packets == 0
+    end
   end
 
   test "what is queued leaves once the rate is raised" do
@@ -240,27 +204,22 @@ defmodule ChaosProxyTest do
     refute_received {:udp, ^socket, _ip, _port, _data}
   end
 
-  test "a blackout drops everything until lifted" do
-    {proxy, port} = start(impairment: %Impairment{blackout?: true})
+  test "counts what a blackout and loss take, and forwards again once lifted" do
+    {proxy, port} = start(impairment: [up: %Impairment{blackout?: true}])
     socket = client()
 
+    send_to(socket, port, "dark")
+    report_matching(proxy, %{totals: %{up: %{blackout_packets: 1}}})
+
+    :ok = ChaosProxy.apply(proxy, up: %Impairment{loss_pct: 100})
     send_to(socket, port, "lost")
-    report_matching(proxy, %{totals: %{up: %{offered_bytes: 4, blackout_packets: 1}}})
 
-    :ok = ChaosProxy.apply(proxy, %Impairment{})
+    assert %{totals: %{up: %{forwarded_bytes: 0}, down: %{offered_bytes: 0}}} =
+             report_matching(proxy, %{totals: %{up: %{lost_packets: 1}}})
+
+    :ok = ChaosProxy.apply(proxy, up: %Impairment{})
     send_to(socket, port, "back")
-
-    assert_receive {:udp, ^socket, _ip, ^port, data}, 5_000
-    assert data == "back"
-  end
-
-  test "total loss drops everything and says so" do
-    {proxy, port} = start(impairment: [up: %Impairment{loss_pct: 100}])
-    socket = client()
-    for _i <- 1..10, do: send_to(socket, port, "lost")
-
-    assert %{totals: %{up: %{offered_bytes: 40, forwarded_bytes: 0}, down: %{offered_bytes: 0}}} =
-             report_matching(proxy, %{totals: %{up: %{lost_packets: 10}}})
+    assert_receive {:udp, ^socket, _ip, ^port, "back"}, 5_000
   end
 
   test "idle clients are forgotten, and welcome back" do

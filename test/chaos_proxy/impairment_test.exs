@@ -3,8 +3,6 @@ defmodule ChaosProxy.ImpairmentTest do
 
   alias ChaosProxy.Impairment
 
-  doctest Impairment
-
   test "is a transparent link by default" do
     assert %Impairment{blackout?: false, loss_pct: 0, rate_kbps: :infinity, delay_ms: 0} =
              %Impairment{}

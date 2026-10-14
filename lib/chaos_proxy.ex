@@ -14,15 +14,8 @@ defmodule ChaosProxy do
   one access link in front of them would be; a bottleneck per client takes a
   proxy per client.
 
-      config = ChaosProxy.Config.new!(upstream_port: 4443, seed: 7)
-      {:ok, proxy} = ChaosProxy.start_link(config)
-      port = ChaosProxy.port(proxy)
-
-      :ok = ChaosProxy.apply(proxy, %ChaosProxy.Impairment{rate_kbps: 700, delay_ms: 10})
-      ChaosProxy.report(proxy)
-
   The options are in `ChaosProxy.Config`, and what the link does not model in
-  the README's [Fidelity](readme.html#fidelity) section.
+  the README's [Fidelity](README.md#fidelity) section.
   """
 
   use GenServer
@@ -64,12 +57,11 @@ defmodule ChaosProxy do
         }
 
   @typedoc """
-  The counters of one second, counted from the proxy's start. There is none
-  for a second nothing happened in.
+  The counters of one second, counted from the proxy's start. Seconds may be
+  missing from a report: do not assume they are consecutive.
   """
   @type second :: %{second: non_neg_integer(), up: counters(), down: counters()}
 
-  @typedoc "What `apply/2` takes."
   @type impairments ::
           Impairment.t() | [{:up, Impairment.t()} | {:down, Impairment.t()}]
 
@@ -108,8 +100,7 @@ defmodule ChaosProxy do
   Starts a proxy linked to the caller.
 
   When the port clients send to cannot be opened, the error is
-  `{:listen, reason}`, as in `{:error, {:listen, :eaddrinuse}}`, and a caller
-  that does not trap exits exits with it, as with `GenServer.start_link/3`.
+  `{:listen, reason}`, as in `{:error, {:listen, :eaddrinuse}}`.
   """
   @spec start_link(Config.t()) :: GenServer.on_start()
   def start_link(%Config{} = config) do
@@ -308,8 +299,7 @@ defmodule ChaosProxy do
     _result = :gen_udp.send(state.listen, ip, port, data)
   end
 
-  # The client's upstream socket, opened for a new client unless the proxy is
-  # at `:max_clients` even after forgetting idle ones, or out of sockets.
+  # The client's upstream socket, opened on its first packet.
   @spec upstream(State.t(), Clients.client(), float()) ::
           {:ok, :gen_udp.socket(), State.t()} | {:refused, State.t()}
   defp upstream(state, client, now) do
@@ -332,7 +322,7 @@ defmodule ChaosProxy do
       true ->
         {:refused, state}
 
-      # The clients it has are worth more than the one it cannot take.
+      # Refused rather than crashing, which would drop every client.
       {:error, reason} ->
         Logger.warning("ChaosProxy refused a client, no upstream socket: #{inspect(reason)}")
         {:refused, state}
@@ -347,8 +337,7 @@ defmodule ChaosProxy do
   defp full?(%State{config: %Config{max_clients: :infinity}}), do: false
   defp full?(state), do: Clients.size(state.clients) >= state.config.max_clients
 
-  # A client that went away leaves its upstream socket behind; checked when a
-  # second rolls over, on `report/1` and when the proxy is full.
+  # A client that went away leaves its upstream socket behind.
   @spec expire_clients(State.t(), float()) :: State.t()
   defp expire_clients(state, now) do
     {sockets, clients} = Clients.expire(state.clients, state.config.client_idle_ms, now)

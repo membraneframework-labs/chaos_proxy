@@ -180,11 +180,12 @@ defmodule ChaosProxy.LinkTest do
     test "has runs of every length, the longer the rarer" do
       link = Link.new(%Impairment{loss_pct: 10, loss_burst: 4}, 3, 0)
       {outcomes, _link} = burst(link, 400_000)
-      lengths = outcomes |> runs() |> Enum.frequencies()
+      runs = runs(outcomes)
 
       # A run goes on with the probability 3/4.
-      for length <- 1..8 do
-        assert_in_delta lengths[length + 1] / lengths[length], 0.75, 0.05
+      for n <- 1..8 do
+        expected = 0.75 ** (n - 1)
+        assert_in_delta Enum.count(runs, &(&1 >= n)) / length(runs), expected, expected * 0.1
       end
     end
 
@@ -343,6 +344,17 @@ defmodule ChaosProxy.LinkTest do
 
       assert held.(7) == held.(7)
       assert held.(7) != held.(8)
+    end
+
+    test "is not what another link loses by" do
+      # The proxy's two directions are links with neighbouring seeds.
+      streams =
+        Enum.flat_map(0..20, fn seed ->
+          link = Link.new(%Impairment{}, seed, 0)
+          [link.rng, link.jitter_rng]
+        end)
+
+      assert length(Enum.uniq(streams)) == length(streams)
     end
 
     test "does not change what is lost" do

@@ -38,14 +38,19 @@ defmodule ChaosProxy.Link do
   @enforce_keys [:impairment, :rng, :jitter_rng, :queue, :delayed, :refilled_at]
   defstruct @enforce_keys ++ [queue_bytes: 0, tokens: 0.0, bad?: false]
 
-  @doc "A link holding nothing. `seed` makes its losses and its jitter repeatable."
+  @doc """
+  A link holding nothing. `seed` makes its losses and its jitter repeatable;
+  links with different seeds draw independently.
+  """
   @spec new(Impairment.t(), integer(), number()) :: t()
   def new(%Impairment{} = impairment, seed, now) do
+    rng = :rand.seed_s(:exsss, seed)
+
     %__MODULE__{
       impairment: impairment,
-      rng: :rand.seed_s(:exsss, {seed, seed + 1, seed + 2}),
+      rng: rng,
       # Of its own, so that the jitter does not change what is lost.
-      jitter_rng: :rand.seed_s(:exsss, {seed + 3, seed + 4, seed + 5}),
+      jitter_rng: :rand.jump(rng),
       queue: :queue.new(),
       delayed: :queue.new(),
       refilled_at: now

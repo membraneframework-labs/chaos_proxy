@@ -168,7 +168,7 @@ defmodule ChaosProxy do
            started_at: now,
            links: %{
              down: Link.new(config.impairment.down, config.seed, now),
-             up: Link.new(config.impairment.up, config.seed + 3, now)
+             up: Link.new(config.impairment.up, config.seed + 1, now)
            },
            stats: Stats.new(config.history)
          }}

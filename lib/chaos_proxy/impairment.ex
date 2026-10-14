@@ -59,39 +59,73 @@ defmodule ChaosProxy.Impairment do
     {r * odds, r}
   end
 
-  # `ChaosProxy.apply/2`'s argument as a map of the directions it sets.
-  @doc false
-  @spec split(ChaosProxy.impairments()) :: %{optional(ChaosProxy.direction()) => t()}
-  def split(%__MODULE__{} = down) do
-    check!(down)
+  @expected [
+    blackout?: "a boolean",
+    loss_pct: "an integer from 0 to 100",
+    loss_burst: "1 or more",
+    rate_kbps: "above 0 or :infinity",
+    queue_ms: "a positive integer",
+    delay_ms: "a non-negative integer",
+    jitter_ms: "a non-negative integer"
+  ]
 
-    %{
-      down: down,
-      up: %__MODULE__{
+  # `ChaosProxy.apply/2`'s argument, checked, as a map of the directions it
+  # sets.
+  @doc false
+  @spec parse(term()) ::
+          {:ok, %{optional(ChaosProxy.direction()) => t()}} | {:error, String.t()}
+  def parse(%__MODULE__{} = down) do
+    with :ok <- check(down) do
+      up = %__MODULE__{
         delay_ms: down.delay_ms,
         jitter_ms: down.jitter_ms,
         blackout?: down.blackout?
       }
-    }
+
+      {:ok, %{down: down, up: up}}
+    end
   end
 
-  def split(impairments) when is_list(impairments) do
-    Enum.each(impairments, fn {_direction, impairment} -> check!(impairment) end)
-    Map.new(impairments)
+  def parse(impairments) when is_list(impairments) do
+    Enum.reduce_while(impairments, {:ok, %{}}, fn
+      {direction, %__MODULE__{} = impairment}, {:ok, parsed} when direction in [:up, :down] ->
+        case check(impairment) do
+          :ok -> {:cont, {:ok, Map.put(parsed, direction, impairment)}}
+          error -> {:halt, error}
+        end
+
+      other, _parsed ->
+        {:halt,
+         {:error, "expected {:up | :down, %ChaosProxy.Impairment{}}, got: #{inspect(other)}"}}
+    end)
   end
 
-  @spec check!(t()) :: :ok
-  defp check!(%__MODULE__{loss_burst: burst} = impairment)
-       when is_number(burst) and burst >= 1,
-       do: rate!(impairment)
+  def parse(other) do
+    {:error,
+     "impairments must be a %ChaosProxy.Impairment{} or a keyword list of them, got: " <>
+       inspect(other)}
+  end
 
-  defp check!(%__MODULE__{loss_burst: burst}),
-    do: raise(ArgumentError, ":loss_burst must be 1 or more, got: #{inspect(burst)}")
+  @spec check(t()) :: :ok | {:error, String.t()}
+  defp check(impairment) do
+    case Enum.find(@expected, fn {key, _expected} ->
+           not valid?(key, Map.fetch!(impairment, key))
+         end) do
+      nil ->
+        :ok
 
-  @spec rate!(t()) :: :ok
-  defp rate!(%__MODULE__{rate_kbps: :infinity}), do: :ok
-  defp rate!(%__MODULE__{rate_kbps: rate}) when is_number(rate) and rate > 0, do: :ok
+      {key, expected} ->
+        {:error,
+         "#{inspect(key)} must be #{expected}, got: #{inspect(Map.fetch!(impairment, key))}"}
+    end
+  end
 
-  defp rate!(%__MODULE__{rate_kbps: rate}),
-    do: raise(ArgumentError, ":rate_kbps must be above 0 or :infinity, got: #{inspect(rate)}")
+  @spec valid?(atom(), term()) :: boolean()
+  defp valid?(:blackout?, blackout?), do: is_boolean(blackout?)
+  defp valid?(:loss_pct, pct), do: pct in 0..100
+  defp valid?(:loss_burst, burst), do: is_number(burst) and burst >= 1
+  defp valid?(:rate_kbps, rate), do: rate == :infinity or (is_number(rate) and rate > 0)
+  defp valid?(:queue_ms, queue_ms), do: is_integer(queue_ms) and queue_ms > 0
+  defp valid?(:delay_ms, delay_ms), do: is_integer(delay_ms) and delay_ms >= 0
+  defp valid?(:jitter_ms, jitter_ms), do: is_integer(jitter_ms) and jitter_ms >= 0
 end

@@ -5,7 +5,7 @@ defmodule ChaosProxyTest do
   # the timers are spaced.
   use ExUnit.Case, async: true
 
-  alias ChaosProxy.{Config, Impairment}
+  alias ChaosProxy.Impairment
 
   @loopback {127, 0, 0, 1}
   @socket_opts [:binary, active: true, ip: @loopback, recbuf: 1_000_000]
@@ -35,8 +35,8 @@ defmodule ChaosProxyTest do
   end
 
   defp start(opts \\ []) do
-    config = Config.new!([upstream_port: echo_server(), seed: 1] ++ opts)
-    proxy = start_supervised!({ChaosProxy, config})
+    options = struct!(ChaosProxy, [upstream_port: echo_server(), seed: 1] ++ opts)
+    proxy = start_supervised!({ChaosProxy, options})
     {proxy, ChaosProxy.port(proxy)}
   end
 
@@ -101,16 +101,19 @@ defmodule ChaosProxyTest do
       :gen_udp.open(0, [:binary, :inet6, active: true, ip: {0, 0, 0, 0, 0, 0, 0, 1}])
 
     {:ok, upstream_port} = :inet.port(upstream)
-    config = Config.new!(upstream_host: "::1", upstream_port: upstream_port)
-    proxy = start_supervised!({ChaosProxy, config})
+
+    proxy =
+      start_supervised!(
+        {ChaosProxy, %ChaosProxy{upstream_host: "::1", upstream_port: upstream_port}}
+      )
 
     send_to(client(), ChaosProxy.port(proxy), "v6")
     assert_receive {:udp, ^upstream, _ip, _port, "v6"}, 5_000
   end
 
-  test "registers under the config's name" do
+  test "registers under its name" do
     name = :"proxy_#{System.unique_integer([:positive])}"
-    proxy = start_supervised!({ChaosProxy, Config.new!(upstream_port: echo_server(), name: name)})
+    proxy = start_supervised!({ChaosProxy, %ChaosProxy{upstream_port: echo_server(), name: name}})
 
     assert Process.whereis(name) == proxy
     assert ChaosProxy.port(name) == ChaosProxy.port(proxy)
@@ -125,12 +128,19 @@ defmodule ChaosProxyTest do
   end
 
   test "says so when the port it was given is taken" do
-    Process.flag(:trap_exit, true)
     {:ok, socket} = :gen_udp.open(0, @socket_opts)
     {:ok, taken} = :inet.port(socket)
-    config = Config.new!(upstream_port: echo_server(), listen_port: taken)
 
-    assert ChaosProxy.start_link(config) == {:error, {:listen, :eaddrinuse}}
+    assert ChaosProxy.start(%ChaosProxy{upstream_port: echo_server(), listen_port: taken}) ==
+             {:error, {:listen, :eaddrinuse}}
+  end
+
+  test "a linked caller exits with the reason the proxy did not start" do
+    {_caller, monitor} =
+      spawn_monitor(fn -> ChaosProxy.start_link(%ChaosProxy{upstream_port: 0}) end)
+
+    assert_receive {:DOWN, ^monitor, :process, _caller,
+                    {:validation_failed, ":upstream_port must be a port, got: 0"}}
   end
 
   test "a packet takes no less than the delay of both directions" do
@@ -189,6 +199,17 @@ defmodule ChaosProxyTest do
       end
 
     assert received == Enum.to_list(1..8)
+  end
+
+  test "apply/2 refuses an impairment in the caller and leaves the proxy as it was" do
+    {proxy, port} = start(impairment: [up: %Impairment{blackout?: true}])
+
+    assert_raise ArgumentError, ~r/:rate_kbps must be above 0/, fn ->
+      ChaosProxy.apply(proxy, %Impairment{rate_kbps: 0})
+    end
+
+    send_to(client(), port, "dark")
+    report_matching(proxy, %{totals: %{up: %{blackout_packets: 1}}})
   end
 
   test "apply/2 leaves the direction it does not name as it is" do

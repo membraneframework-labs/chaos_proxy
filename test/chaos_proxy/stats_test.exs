@@ -54,10 +54,10 @@ defmodule ChaosProxy.StatsTest do
     assert {:same, ^stats} = Stats.rotate(stats, 1)
   end
 
-  # Seconds from 0 on, in order, some skipped.
   defp seconds do
-    gaps = list_of(integer(1..5), max_length: 50)
-    map(gaps, fn gaps -> Enum.scan([0 | gaps], &+/2) end)
+    integer(1..5)
+    |> list_of(max_length: 50)
+    |> map(fn gaps -> Enum.scan([0 | gaps], &+/2) end)
   end
 
   property "reports the last `history` seconds oldest first, and all of them in the totals" do

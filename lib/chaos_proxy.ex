@@ -14,15 +14,25 @@ defmodule ChaosProxy do
   one access link in front of them would be; a bottleneck per client takes a
   proxy per client.
 
-  The options are in `ChaosProxy.Config`, and what the link does not model in
-  the README's [Fidelity](README.md#fidelity) section.
+  The struct holds the options of a proxy to start (see
+  [`%ChaosProxy{}`](`__struct__/0`)):
+
+      {:ok, proxy} = ChaosProxy.start_link(%ChaosProxy{upstream_port: 4443, seed: 7})
+      ChaosProxy.port(proxy)  # point the clients here
+
+  Under a supervisor:
+
+      {ChaosProxy, %ChaosProxy{upstream_port: 4443, name: MyApp.Proxy}}
+
+  What the link does not model is in the README's
+  [Fidelity](README.md#fidelity) section.
   """
 
   use GenServer
 
   require Logger
 
-  alias ChaosProxy.{Clients, Config, Impairment, Link, Stats}
+  alias ChaosProxy.{Clients, Impairment, Link, Options, Stats}
 
   @bucket_ms 1_000
 
@@ -30,6 +40,67 @@ defmodule ChaosProxy do
   # counted) by the shaper rather than silently by the kernel in front of it.
   # The OS default can be small: often ~208 KB on Linux.
   @recbuf 4_000_000
+
+  @doc """
+  The options of a proxy to start.
+
+    * `:upstream_port` (required), `:upstream_host` (default `"127.0.0.1"`) -
+      where the proxy forwards to; the host is a name or an IPv4 or IPv6
+      address, as a string or a tuple, and is resolved as the proxy starts.
+    * `:listen_ip` - the address clients send to (default `{127, 0, 0, 1}`).
+    * `:listen_port` - the port clients send to (default `0`, one the OS
+      picks); read it back with `port/1`.
+    * `:impairment` - the initial impairments, in any form `apply/2` takes
+      (default `[]`, a transparent link).
+    * `:seed` - makes the loss and the jitter repeatable (default `0`).
+    * `:history` - how many seconds `report/1` goes back (default `300`);
+      `:infinity` keeps them all.
+    * `:client_idle_ms` - a client silent this long in both directions is
+      forgotten (default `60_000`); `:infinity` keeps every client.
+    * `:max_clients` - how many clients the proxy keeps at once (default
+      `:infinity`). Beyond it, idle ones are forgotten first; if none is, a
+      new client's packets are refused. A proxy on a public port wants a
+      limit.
+    * `:name` - a name to register the proxy's process under (default `nil`).
+  """
+  @enforce_keys [:upstream_port]
+  defstruct upstream_host: "127.0.0.1",
+            upstream_port: nil,
+            listen_ip: {127, 0, 0, 1},
+            listen_port: 0,
+            impairment: [],
+            seed: 0,
+            history: 300,
+            client_idle_ms: 60_000,
+            max_clients: :infinity,
+            name: nil
+
+  @typedoc """
+  Options of a proxy to start.
+
+  See [`%ChaosProxy{}`](`__struct__/0`) for information about each field.
+  """
+  @type t :: %__MODULE__{
+          upstream_host: :inet.ip_address() | :inet.hostname() | String.t(),
+          upstream_port: :inet.port_number(),
+          listen_ip: :inet.ip_address(),
+          listen_port: :inet.port_number(),
+          impairment: impairments(),
+          seed: integer(),
+          history: limit(pos_integer()),
+          client_idle_ms: limit(non_neg_integer()),
+          max_clients: limit(pos_integer()),
+          name: GenServer.name() | nil
+        }
+
+  @typedoc "A number of something, or no bound on it."
+  @type limit(number) :: number | :infinity
+
+  @typedoc """
+  Why the proxy did not start: its options failed validation, or the port
+  clients send to could not be opened, as in `{:listen, :eaddrinuse}`.
+  """
+  @type start_error :: {:validation_failed, String.t()} | {:listen, :inet.posix()}
 
   @type direction :: :up | :down
 
@@ -68,13 +139,13 @@ defmodule ChaosProxy do
   defmodule State do
     @moduledoc false
 
-    alias ChaosProxy.{Clients, Config, Link, Stats}
+    alias ChaosProxy.{Clients, Link, Options, Stats}
 
     # A pending `{:drain, direction, token}` and when it fires.
     @type timer :: {reference(), token :: reference(), at_ms :: number()}
 
     @type t :: %__MODULE__{
-            config: Config.t(),
+            options: Options.t(),
             listen: :gen_udp.socket(),
             started_at: float(),
             links: %{up: Link.t(), down: Link.t()},
@@ -83,7 +154,7 @@ defmodule ChaosProxy do
             clients: Clients.t()
           }
 
-    @enforce_keys [:config, :listen, :started_at, :links, :stats]
+    @enforce_keys [:options, :listen, :started_at, :links, :stats]
     defstruct @enforce_keys ++ [timers: %{up: nil, down: nil}, clients: %Clients{}]
   end
 
@@ -91,22 +162,35 @@ defmodule ChaosProxy do
   # the way down.
   @typep packet :: {:gen_udp.socket() | Clients.client(), binary()}
 
-  @spec child_spec(Config.t()) :: Supervisor.child_spec()
-  def child_spec(%Config{} = config) do
-    %{id: __MODULE__, start: {__MODULE__, :start_link, [config]}, type: :worker}
+  @doc "A child spec for the proxy; several may share a supervisor."
+  @spec child_spec(t()) :: Supervisor.child_spec()
+  def child_spec(%__MODULE__{} = proxy) do
+    %{
+      id: {__MODULE__, proxy.name || make_ref()},
+      start: {__MODULE__, :start_link, [proxy]},
+      type: :worker
+    }
   end
 
   @doc """
   Starts a proxy linked to the caller.
 
-  When the port clients send to cannot be opened, the error is
-  `{:listen, reason}`, as in `{:error, {:listen, :eaddrinuse}}`.
+  The options are checked as the proxy starts, and a proxy whose options fail
+  validation, or which cannot open its port, stops with a `t:start_error/0`,
+  taking the linked caller with it; a supervisor reports it as the child's
+  start error. `start/1` returns it instead.
   """
-  @spec start_link(Config.t()) :: GenServer.on_start()
-  def start_link(%Config{} = config) do
-    opts = if config.name, do: [name: config.name], else: []
-    GenServer.start_link(__MODULE__, config, opts)
-  end
+  @spec start_link(t()) :: {:ok, pid()} | {:error, start_error() | {:already_started, pid()}}
+  def start_link(%__MODULE__{} = proxy),
+    do: GenServer.start_link(__MODULE__, proxy, name: proxy.name)
+
+  @doc "Starts a proxy not linked to the caller; see `start_link/1`."
+  @spec start(t()) :: {:ok, pid()} | {:error, start_error() | {:already_started, pid()}}
+  def start(%__MODULE__{} = proxy), do: GenServer.start(__MODULE__, proxy, name: proxy.name)
+
+  @doc "Stops the proxy."
+  @spec stop(GenServer.server(), timeout()) :: :ok
+  def stop(proxy, timeout \\ 5_000), do: GenServer.stop(proxy, :normal, timeout)
 
   @doc "The UDP port clients send to."
   @spec port(GenServer.server()) :: :inet.port_number()
@@ -120,12 +204,16 @@ defmodule ChaosProxy do
   uplink only its `delay_ms`, `jitter_ms` and `blackout?`: a bottleneck in
   front of the clients, with the delay of the path back.
 
-  Raises `ArgumentError` for a `rate_kbps` that is not above 0 and for a
-  `loss_burst` below 1.
+  Raises `ArgumentError` for impairments that fail validation, leaving the
+  proxy as it was.
   """
   @spec apply(GenServer.server(), impairments()) :: :ok
-  def apply(proxy, impairments),
-    do: GenServer.call(proxy, {:apply, Impairment.split(impairments)})
+  def apply(proxy, impairments) do
+    case Impairment.parse(impairments) do
+      {:ok, impairments} -> GenServer.call(proxy, {:apply, impairments})
+      {:error, message} -> raise ArgumentError, message
+    end
+  end
 
   @doc """
   The counters of each direction: per second, oldest first and the current
@@ -139,34 +227,44 @@ defmodule ChaosProxy do
   def report(proxy), do: GenServer.call(proxy, :report)
 
   @impl true
-  def init(%Config{} = config) do
+  def init(%__MODULE__{} = proxy) do
+    with {:ok, options} <- parse(proxy),
+         {:ok, listen} <- listen(options) do
+      now = now_ms()
+
+      {:ok,
+       %State{
+         options: options,
+         listen: listen,
+         started_at: now,
+         links: %{
+           down: Link.new(options.impairment.down, options.seed, now),
+           up: Link.new(options.impairment.up, options.seed + 1, now)
+         },
+         stats: Stats.new(options.history)
+       }}
+    else
+      {:error, reason} -> {:stop, reason}
+    end
+  end
+
+  @spec parse(t()) :: {:ok, Options.t()} | {:error, {:validation_failed, String.t()}}
+  defp parse(proxy) do
+    with {:error, message} <- Options.parse(proxy), do: {:error, {:validation_failed, message}}
+  end
+
+  @spec listen(Options.t()) :: {:ok, :gen_udp.socket()} | {:error, {:listen, :inet.posix()}}
+  defp listen(options) do
     opts = [
       :binary,
-      family(config.listen_ip),
+      family(options.listen_ip),
       active: true,
-      ip: config.listen_ip,
+      ip: options.listen_ip,
       recbuf: @recbuf
     ]
 
-    case :gen_udp.open(config.listen_port, opts) do
-      {:ok, listen} ->
-        now = now_ms()
-
-        {:ok,
-         %State{
-           config: config,
-           listen: listen,
-           started_at: now,
-           links: %{
-             down: Link.new(config.impairment.down, config.seed, now),
-             up: Link.new(config.impairment.up, config.seed + 1, now)
-           },
-           stats: Stats.new(config.history)
-         }}
-
-      {:error, reason} ->
-        {:stop, {:listen, reason}}
-    end
+    with {:error, reason} <- :gen_udp.open(options.listen_port, opts),
+         do: {:error, {:listen, reason}}
   end
 
   @impl true
@@ -291,7 +389,7 @@ defmodule ChaosProxy do
   # The upstream socket may have been closed for an expired client meanwhile.
   @spec deliver(State.t(), direction(), packet()) :: :ok | {:error, term()}
   defp deliver(state, :up, {upstream, data}) do
-    %Config{upstream_host: ip, upstream_port: port} = state.config
+    %Options{upstream_host: ip, upstream_port: port} = state.options
     _result = :gen_udp.send(upstream, ip, port, data)
   end
 
@@ -313,7 +411,7 @@ defmodule ChaosProxy do
           {:ok, :gen_udp.socket(), State.t()} | {:refused, State.t()}
   defp admit(state, client, now) do
     state = if full?(state), do: expire_clients(state, now), else: state
-    opts = [:binary, family(state.config.upstream_host), active: true, recbuf: @recbuf]
+    opts = [:binary, family(state.options.upstream_host), active: true, recbuf: @recbuf]
 
     with false <- full?(state),
          {:ok, upstream} <- :gen_udp.open(0, opts) do
@@ -334,13 +432,13 @@ defmodule ChaosProxy do
     do: %{state | clients: Clients.put(state.clients, client, upstream, now)}
 
   @spec full?(State.t()) :: boolean()
-  defp full?(%State{config: %Config{max_clients: :infinity}}), do: false
-  defp full?(state), do: Clients.size(state.clients) >= state.config.max_clients
+  defp full?(%State{options: %Options{max_clients: :infinity}}), do: false
+  defp full?(state), do: Clients.size(state.clients) >= state.options.max_clients
 
   # A client that went away leaves its upstream socket behind.
   @spec expire_clients(State.t(), float()) :: State.t()
   defp expire_clients(state, now) do
-    {sockets, clients} = Clients.expire(state.clients, state.config.client_idle_ms, now)
+    {sockets, clients} = Clients.expire(state.clients, state.options.client_idle_ms, now)
     Enum.each(sockets, &:gen_udp.close/1)
     %{state | clients: clients}
   end

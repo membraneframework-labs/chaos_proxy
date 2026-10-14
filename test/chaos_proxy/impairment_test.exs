@@ -18,7 +18,7 @@ defmodule ChaosProxy.ImpairmentTest do
     end
   end
 
-  describe "split/1" do
+  describe "parse/1" do
     test "a bare impairment is the downlink, its delay, jitter and blackout mirrored on the uplink" do
       down = %Impairment{
         rate_kbps: 700,
@@ -30,48 +30,58 @@ defmodule ChaosProxy.ImpairmentTest do
         blackout?: true
       }
 
-      assert Impairment.split(down) == %{
-               down: down,
-               up: %Impairment{delay_ms: 10, jitter_ms: 4, blackout?: true}
-             }
+      assert Impairment.parse(down) ==
+               {:ok, %{down: down, up: %Impairment{delay_ms: 10, jitter_ms: 4, blackout?: true}}}
     end
 
     test "a keyword list sets the directions it names and no other" do
       thin = %Impairment{rate_kbps: 500}
 
-      assert Impairment.split(up: thin) == %{up: thin}
-      assert Impairment.split(down: thin) == %{down: thin}
-      assert Impairment.split(up: thin, down: %Impairment{}) == %{up: thin, down: %Impairment{}}
-      assert Impairment.split([]) == %{}
+      assert Impairment.parse(up: thin) == {:ok, %{up: thin}}
+      assert Impairment.parse(down: thin) == {:ok, %{down: thin}}
+
+      assert Impairment.parse(up: thin, down: %Impairment{}) ==
+               {:ok, %{up: thin, down: %Impairment{}}}
+
+      assert Impairment.parse([]) == {:ok, %{}}
     end
 
     test "takes any rate above 0, and no limit" do
       for rate <- [1, 0.5, 1.0e-3, 100_000, :infinity] do
         impairment = %Impairment{rate_kbps: rate}
-        assert %{down: ^impairment} = Impairment.split(impairment)
+        assert {:ok, %{down: ^impairment}} = Impairment.parse(impairment)
       end
     end
 
-    test "refuses bursts of less than a packet" do
-      for burst <- [0, 0.5, -1, nil] do
-        assert_raise ArgumentError, ~r/loss_burst must be 1 or more/, fn ->
-          Impairment.split(%Impairment{loss_pct: 5, loss_burst: burst})
-        end
+    test "refuses a field outside its type" do
+      for {fields, message} <- [
+            {[loss_burst: 0.5], ~r/:loss_burst must be 1 or more, got: 0.5/},
+            {[loss_burst: nil], ~r/:loss_burst must be 1 or more/},
+            {[rate_kbps: 0], ~r/:rate_kbps must be above 0 or :infinity, got: 0/},
+            {[rate_kbps: -0.0], ~r/:rate_kbps must be above 0/},
+            {[loss_pct: 101], ~r/:loss_pct must be an integer from 0 to 100/},
+            {[loss_pct: 2.5], ~r/:loss_pct must be an integer from 0 to 100/},
+            {[blackout?: nil], ~r/:blackout\? must be a boolean/},
+            {[queue_ms: 0], ~r/:queue_ms must be a positive integer/},
+            {[delay_ms: -1], ~r/:delay_ms must be a non-negative integer/},
+            {[jitter_ms: 1.5], ~r/:jitter_ms must be a non-negative integer/}
+          ] do
+        assert {:error, reason} = Impairment.parse(struct!(Impairment, fields))
+        assert reason =~ message
       end
     end
 
-    test "refuses a rate that lets nothing through" do
-      for rate <- [0, 0.0, -0.0, -5, -5.0] do
-        assert_raise ArgumentError, ~r/rate_kbps must be above 0/, fn ->
-          Impairment.split(%Impairment{rate_kbps: rate})
-        end
-      end
-    end
+    test "refuses a keyword list with any impairment it would refuse bare, or another key" do
+      assert {:error, reason} =
+               Impairment.parse(down: %Impairment{}, up: %Impairment{rate_kbps: 0})
 
-    test "refuses a keyword list with any impairment it would refuse bare" do
-      assert_raise ArgumentError, ~r/rate_kbps must be above 0/, fn ->
-        Impairment.split(down: %Impairment{}, up: %Impairment{rate_kbps: 0})
-      end
+      assert reason =~ ~r/:rate_kbps must be above 0/
+
+      assert {:error, reason} = Impairment.parse(dwon: %Impairment{})
+      assert reason =~ ~r/expected \{:up \| :down, %ChaosProxy.Impairment\{\}\}, got: \{:dwon/
+
+      assert {:error, reason} = Impairment.parse(%{down: %Impairment{}})
+      assert reason =~ ~r/impairments must be/
     end
   end
 end

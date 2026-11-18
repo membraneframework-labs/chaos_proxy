@@ -32,7 +32,7 @@ end
 ```elixir
 alias ChaosProxy.Impairment
 
-{:ok, proxy} = ChaosProxy.start_link(%ChaosProxy{upstream_port: 4443, seed: 7})
+{:ok, proxy} = ChaosProxy.start_link(upstream_port: 4443, seed: 7)
 port = ChaosProxy.port(proxy)   # point the clients here
 
 :ok = ChaosProxy.apply(proxy, %Impairment{rate_kbps: 700, queue_ms: 200, delay_ms: 10})
@@ -40,10 +40,6 @@ port = ChaosProxy.port(proxy)   # point the clients here
 
 %{seconds: seconds, totals: %{up: up, down: down}, clients: 1} = ChaosProxy.report(proxy)
 ```
-
-The knobs are in `ChaosProxy.Impairment` and the options in `%ChaosProxy{}`.
-They are checked as the proxy starts, which fails with
-`{:validation_failed, message}` on invalid ones.
 
 ## Fidelity
 

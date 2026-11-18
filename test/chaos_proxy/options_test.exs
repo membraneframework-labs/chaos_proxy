@@ -3,14 +3,14 @@ defmodule ChaosProxy.OptionsTest do
 
   alias ChaosProxy.{Impairment, Options}
 
-  @spec parse!(keyword()) :: Options.t()
-  defp parse!(fields) do
-    {:ok, options} = Options.parse(struct!(ChaosProxy, [upstream_port: 1] ++ fields))
+  @spec parse!(ChaosProxy.options()) :: Options.t()
+  defp parse!(opts) do
+    {:ok, options} = Options.parse(Keyword.merge([upstream_port: 1], opts))
     options
   end
 
   test "options that fail validation stop the proxy as it starts" do
-    for {fields, message} <- [
+    for {opts, message} <- [
           {[upstream_port: nil], ~r/:upstream_port must be a port, got: nil/},
           {[upstream_port: 65_536], ~r/:upstream_port must be a port/},
           {[listen_ip: "127.0.0.1"], ~r/:listen_ip must be an IP address/},
@@ -22,10 +22,22 @@ defmodule ChaosProxy.OptionsTest do
           {[impairment: [up: %Impairment{rate_kbps: 0}]], ~r/:rate_kbps must be above 0/},
           {[upstream_host: "no such host.invalid"], ~r/cannot resolve :upstream_host/}
         ] do
-      proxy = struct!(ChaosProxy, [upstream_port: 1] ++ fields)
-      assert {:error, {:validation_failed, reason}} = ChaosProxy.start(proxy)
+      opts = Keyword.merge([upstream_port: 1], opts)
+      assert {:error, {:validation_failed, reason}} = ChaosProxy.start(opts)
       assert reason =~ message
     end
+  end
+
+  test "a list that is not the proxy's options stops it too" do
+    assert ChaosProxy.start(upstream_port: 1, upstrem_host: "::1") ==
+             {:error, {:validation_failed, "unknown keys [:upstrem_host]"}}
+
+    assert ChaosProxy.start(listen_port: 1) ==
+             {:error, {:validation_failed, ":upstream_port is required"}}
+
+    assert ChaosProxy.start([:upstream_port]) ==
+             {:error,
+              {:validation_failed, "options must be a keyword list, got: [:upstream_port]"}}
   end
 
   test "resolves the upstream host to an address" do

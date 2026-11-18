@@ -35,7 +35,7 @@ defmodule ChaosProxyTest do
   end
 
   defp start(opts \\ []) do
-    options = struct!(ChaosProxy, [upstream_port: echo_server(), seed: 1] ++ opts)
+    options = Keyword.merge([upstream_port: echo_server(), seed: 1], opts)
     proxy = start_supervised!({ChaosProxy, options})
     {proxy, ChaosProxy.port(proxy)}
   end
@@ -102,10 +102,7 @@ defmodule ChaosProxyTest do
 
     {:ok, upstream_port} = :inet.port(upstream)
 
-    proxy =
-      start_supervised!(
-        {ChaosProxy, %ChaosProxy{upstream_host: "::1", upstream_port: upstream_port}}
-      )
+    proxy = start_supervised!({ChaosProxy, upstream_host: "::1", upstream_port: upstream_port})
 
     send_to(client(), ChaosProxy.port(proxy), "v6")
     assert_receive {:udp, ^upstream, _ip, _port, "v6"}, 5_000
@@ -113,7 +110,7 @@ defmodule ChaosProxyTest do
 
   test "registers under its name" do
     name = :"proxy_#{System.unique_integer([:positive])}"
-    proxy = start_supervised!({ChaosProxy, %ChaosProxy{upstream_port: echo_server(), name: name}})
+    proxy = start_supervised!({ChaosProxy, upstream_port: echo_server(), name: name})
 
     assert Process.whereis(name) == proxy
     assert ChaosProxy.port(name) == ChaosProxy.port(proxy)
@@ -131,13 +128,12 @@ defmodule ChaosProxyTest do
     {:ok, socket} = :gen_udp.open(0, @socket_opts)
     {:ok, taken} = :inet.port(socket)
 
-    assert ChaosProxy.start(%ChaosProxy{upstream_port: echo_server(), listen_port: taken}) ==
+    assert ChaosProxy.start(upstream_port: echo_server(), listen_port: taken) ==
              {:error, {:listen, :eaddrinuse}}
   end
 
   test "a linked caller exits with the reason the proxy did not start" do
-    {_caller, monitor} =
-      spawn_monitor(fn -> ChaosProxy.start_link(%ChaosProxy{upstream_port: 0}) end)
+    {_caller, monitor} = spawn_monitor(fn -> ChaosProxy.start_link(upstream_port: 0) end)
 
     assert_receive {:DOWN, ^monitor, :process, _caller,
                     {:validation_failed, ":upstream_port must be a port, got: 0"}}

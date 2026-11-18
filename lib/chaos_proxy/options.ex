@@ -1,8 +1,5 @@
 defmodule ChaosProxy.Options do
   @moduledoc false
-  # A `%ChaosProxy{}` parsed in the proxy's `init/1`: every field checked, the
-  # upstream resolved to an address and the impairment split per direction.
-  # The proxy trusts what it holds.
 
   alias ChaosProxy.Impairment
 
@@ -31,8 +28,17 @@ defmodule ChaosProxy.Options do
   ]
   defstruct @enforce_keys
 
-  # What the fields are checked against, in this order; `:upstream_host` and
-  # `:impairment` are parsed on their own.
+  @defaults [
+    upstream_host: "127.0.0.1",
+    listen_ip: {127, 0, 0, 1},
+    listen_port: 0,
+    impairment: [],
+    seed: 0,
+    history: 300,
+    client_idle_ms: 60_000,
+    max_clients: :infinity
+  ]
+
   @expected [
     upstream_port: "a port",
     listen_ip: "an IP address",
@@ -43,36 +49,52 @@ defmodule ChaosProxy.Options do
     max_clients: "a positive integer or :infinity"
   ]
 
-  @spec parse(ChaosProxy.t()) :: {:ok, t()} | {:error, String.t()}
-  def parse(%ChaosProxy{} = proxy) do
-    with :ok <- check(proxy),
-         {:ok, impairment} <- Impairment.parse(proxy.impairment),
-         {:ok, upstream_host} <- resolve(proxy.upstream_host) do
+  @spec parse(ChaosProxy.options()) :: {:ok, t()} | {:error, String.t()}
+  def parse(opts) do
+    with {:ok, opts} <- known(opts),
+         :ok <- check(opts),
+         {:ok, impairment} <- Impairment.parse(opts[:impairment]),
+         {:ok, upstream_host} <- resolve(opts[:upstream_host]) do
       transparent = %{up: %Impairment{}, down: %Impairment{}}
 
       {:ok,
        %__MODULE__{
          upstream_host: upstream_host,
-         upstream_port: proxy.upstream_port,
-         listen_ip: proxy.listen_ip,
-         listen_port: proxy.listen_port,
+         upstream_port: opts[:upstream_port],
+         listen_ip: opts[:listen_ip],
+         listen_port: opts[:listen_port],
          impairment: Map.merge(transparent, impairment),
-         seed: proxy.seed,
-         history: proxy.history,
-         client_idle_ms: proxy.client_idle_ms,
-         max_clients: proxy.max_clients
+         seed: opts[:seed],
+         history: opts[:history],
+         client_idle_ms: opts[:client_idle_ms],
+         max_clients: opts[:max_clients]
        }}
     end
   end
 
-  @spec check(ChaosProxy.t()) :: :ok | {:error, String.t()}
-  defp check(proxy) do
-    case Enum.find(@expected, fn {key, _expected} -> not valid?(key, Map.fetch!(proxy, key)) end) do
+  @spec known(term()) :: {:ok, keyword()} | {:error, String.t()}
+  defp known(opts) do
+    cond do
+      not Keyword.keyword?(opts) ->
+        {:error, "options must be a keyword list, got: #{inspect(opts)}"}
+
+      not Keyword.has_key?(opts, :upstream_port) ->
+        {:error, ":upstream_port is required"}
+
+      true ->
+        with {:error, keys} <- Keyword.validate(opts, [:upstream_port, :name | @defaults]),
+             do: {:error, "unknown keys #{inspect(keys)}"}
+    end
+  end
+
+  @spec check(keyword()) :: :ok | {:error, String.t()}
+  defp check(opts) do
+    case Enum.find(@expected, fn {key, _expected} -> not valid?(key, opts[key]) end) do
       nil ->
         :ok
 
       {key, expected} ->
-        {:error, "#{inspect(key)} must be #{expected}, got: #{inspect(Map.fetch!(proxy, key))}"}
+        {:error, "#{inspect(key)} must be #{expected}, got: #{inspect(opts[key])}"}
     end
   end
 
@@ -88,7 +110,6 @@ defmodule ChaosProxy.Options do
   @spec limit?(term(), non_neg_integer()) :: boolean()
   defp limit?(value, min), do: value == :infinity or (is_integer(value) and value >= min)
 
-  # Either family; an address passes through as it is.
   @spec resolve(term()) :: {:ok, :inet.ip_address()} | {:error, String.t()}
   defp resolve(host) do
     name = if is_binary(host), do: String.to_charlist(host), else: host
